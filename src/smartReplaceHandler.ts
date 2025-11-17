@@ -333,6 +333,11 @@ export class SmartReplaceHandler {
     const maxIterations = targetLines.length + currentLines.length + 100;
     let iterations = 0;
 
+    // 跟踪上一次迭代的索引，用于检测死循环
+    let lastCurrentIndex = -1;
+    let lastTargetIndex = -1;
+    let stuckCount = 0; // 连续停滞的次数
+
     while (targetLineIndex < targetLines.length) {
       // 检查是否超过最大迭代次数
       if (++iterations > maxIterations) {
@@ -340,6 +345,32 @@ export class SmartReplaceHandler {
         this.logger.info(`[ERROR] State: currentLineIndex=${currentLineIndex}, targetLineIndex=${targetLineIndex}`);
         return { state: 'mismatch', offset: 0 };
       }
+
+      // 检测死循环：如果索引连续3次没有变化，强制中断
+      if (lastCurrentIndex === currentLineIndex && lastTargetIndex === targetLineIndex) {
+        stuckCount++;
+        if (stuckCount >= 3) {
+          this.logger.info(`[ERROR] Detected infinite loop: indices stuck at currentLineIndex=${currentLineIndex}, targetLineIndex=${targetLineIndex} for ${stuckCount} iterations`);
+          this.logger.info(`[DEBUG] Current line: "${currentLines[currentLineIndex] || '<EOF>'}"`);
+          this.logger.info(`[DEBUG] Target line: "${targetLines[targetLineIndex]}"`);
+
+          // 强制返回gap状态，在当前位置插入换行符
+          const lineStartOffset = this.getLineStartOffset(normalizedCurrent, Math.min(currentLineIndex, currentLines.length - 1));
+          const originalOffset = this.mapNormalizedToOriginal(lineStartOffset, currentMapping);
+          const leadingSpaces = this.getLeadingSpaces(targetLines[targetLineIndex]);
+
+          this.logger.info(`[FIX] Breaking loop by inserting newline at offset ${originalOffset}`);
+          return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+        }
+      } else {
+        // 索引有变化，重置计数器
+        stuckCount = 0;
+      }
+
+      // 记录当前索引
+      lastCurrentIndex = currentLineIndex;
+      lastTargetIndex = targetLineIndex;
+
       const targetLine = targetLines[targetLineIndex];
 
       // 如果 current 已经没有更多行了
@@ -432,6 +463,27 @@ export class SmartReplaceHandler {
       this.logger.info(`[DEBUG] Line ${targetLineIndex} mismatch:`);
       this.logger.info(`[DEBUG]   Current[${currentLineIndex}]: "${currentLine}"`);
       this.logger.info(`[DEBUG]   Target[${targetLineIndex}]: "${targetLine}"`);
+
+      // 特殊处理：检测是否删除了代码块（如if{}, for{}, while{}等）
+      // 这种情况下，目标有多行内容，但当前只有一行闭合符号
+      const isBlockDeletion = this.detectBlockDeletion(
+        currentLineIndex,
+        targetLineIndex,
+        currentLines,
+        targetLines
+      );
+
+      if (isBlockDeletion) {
+        this.logger.info(`[DEBUG] Detected block deletion (e.g., if{}, for{} block removed)`);
+        this.logger.info(`[DEBUG] Will insert missing lines starting from target line ${targetLineIndex}`);
+
+        // 在当前行之前插入目标行
+        const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+        const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
+        const leadingSpaces = this.getLeadingSpaces(targetLine);
+
+        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+      }
 
       // 检测是否需要插入新行（行数不匹配的情况）
       const isCurrentEmpty = currentLine.trim() === '';
@@ -781,6 +833,107 @@ export class SmartReplaceHandler {
     }
 
     return prev[n];
+  }
+
+  /**
+   * 检测是否删除了代码块（如if{}, for{}, while{}等）
+   * 场景：目标文件有完整的代码块，当前文件删除了块内容
+   *
+   * 例如：
+   * Target:  if (x) {        Current:  if (x) {
+   *              stmt1                     }
+   *              stmt2
+   *          }
+   *
+   * @returns true 如果检测到代码块被删除
+   */
+  private detectBlockDeletion(
+    currentLineIndex: number,
+    targetLineIndex: number,
+    currentLines: string[],
+    targetLines: string[]
+  ): boolean {
+    // 条件1: 当前行和目标行的相似度很低（可能完全不同）
+    const currentLine = currentLines[currentLineIndex] || '';
+    const targetLine = targetLines[targetLineIndex];
+
+    // 条件2: 检查目标文件是否有多行内容，而当前文件缺少这些行
+    // 通过"向前查找"检测：当前行是否匹配目标文件后面的某行
+    const maxLookAhead = 15; // 查找范围增加到15行，覆盖更多场景
+
+    this.logger.info(`[DEBUG] detectBlockDeletion: checking if current[${currentLineIndex}]="${currentLine.trim()}" matches later target lines`);
+
+    for (let futureTargetIdx = targetLineIndex + 1;
+         futureTargetIdx < Math.min(targetLineIndex + maxLookAhead + 1, targetLines.length);
+         futureTargetIdx++) {
+
+      // 如果当前行匹配目标文件后面的某一行
+      if (currentLine === targetLines[futureTargetIdx] ||
+          this.linesEssentiallyMatch(currentLine, targetLines[futureTargetIdx])) {
+
+        const missingLineCount = futureTargetIdx - targetLineIndex;
+        this.logger.info(`[DEBUG] MATCH found at Target[${futureTargetIdx}]! Missing ${missingLineCount} lines`);
+
+        const missingLines = targetLines.slice(targetLineIndex, futureTargetIdx);
+
+        // 条件3: 检查缺失的这些行是否构成一个代码块
+        // 方法1: 检查缺失的行本身是否有块模式
+        let hasBlockPattern = this.hasCodeBlockPattern(missingLines);
+
+        // 方法2: 如果缺失行本身没有块模式，检查前一行（已匹配的行）是否是块开始
+        // 这处理了块内容被删除但块开始行已经匹配的情况
+        if (!hasBlockPattern && targetLineIndex > 0) {
+          const previousTargetLine = targetLines[targetLineIndex - 1];
+          this.logger.info(`[DEBUG] Checking if previous line is block start: "${previousTargetLine.trim()}"`);
+
+          // 将前一行和缺失行一起检查
+          const linesWithPrevious = [previousTargetLine, ...missingLines];
+          hasBlockPattern = this.hasCodeBlockPattern(linesWithPrevious);
+          this.logger.info(`[DEBUG] hasCodeBlockPattern (with previous line): ${hasBlockPattern}`);
+        }
+
+        if (hasBlockPattern && missingLineCount >= 2) {
+          this.logger.info(`[DEBUG] Block deletion detected: ${missingLineCount} lines missing`);
+          this.logger.info(`[DEBUG] Current line matches Target[${futureTargetIdx}], indicating Target[${targetLineIndex}-${futureTargetIdx - 1}] are missing`);
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 检查一组行是否包含代码块模式
+   * 识别常见的代码块结构：
+   * - 大括号块：{ ... }
+   * - Python冒号块：if/for/while/def/class ... :
+   * - HTML标签块：<tag> ... </tag>
+   */
+  private hasCodeBlockPattern(lines: string[]): boolean {
+    if (lines.length === 0) {
+      return false;
+    }
+
+    const allText = lines.join(' ').trim();
+
+    // 模式1: C-like大括号块 (if{}, for{}, while{}, function{} 等)
+    const hasBraceBlock = /\b(if|for|while|function|class|def|struct)\s*\([^)]*\)\s*\{|\{\s*$/.test(lines[0]);
+
+    // 模式2: Python冒号块
+    const hasColonBlock = /\b(if|for|while|def|class|with|try|except|finally|elif|else)\b.*:\s*$/.test(lines[0]);
+
+    // 模式3: HTML/XML标签块
+    const hasTagBlock = /<\w+[^>]*>.*<\/\w+>/.test(allText) || /<\w+[^>]*>\s*$/.test(lines[0]);
+
+    // 模式4: 检查是否有明显的缩进增加（块的特征）
+    const firstIndent = this.getLeadingSpaces(lines[0]).length;
+    const hasIndentIncrease = lines.slice(1).some(line => {
+      const lineIndent = this.getLeadingSpaces(line).length;
+      return lineIndent > firstIndent;
+    });
+
+    return hasBraceBlock || hasColonBlock || hasTagBlock || hasIndentIncrease;
   }
 
   /**
