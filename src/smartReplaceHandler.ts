@@ -6,6 +6,10 @@ import { NotificationManager } from './notificationManager';
 
 export class SmartReplaceHandler {
   private documentSnapshot?: { version: number; text: string };
+  private insertHistory: Array<{ offset: number; text: string; timestamp: number }> = [];
+  private lastInsertAttempt?: { offset: number; text: string };
+  private repeatedInsertCount = 0;
+  private readonly maxRepeatedInsertAttempts = 3;
 
   constructor(
     private readonly targetFileManager: TargetFileManager,
@@ -138,6 +142,10 @@ export class SmartReplaceHandler {
 
   reset(): void {
     this.documentSnapshot = undefined;
+    this.insertHistory = [];
+    this.lastInsertAttempt = undefined;
+    this.repeatedInsertCount = 0;
+    this.logger.info('[RESET] Cleared insert history');
   }
 
   private async insertAt(
@@ -146,8 +154,49 @@ export class SmartReplaceHandler {
     text: string,
     editOptions: UndoFriendlyEditOptions,
   ): Promise<boolean> {
-    const position = editor.document.positionAt(offset);
     const charDesc = this.getCharDescription(text);
+    const now = Date.now();
+
+    // 检测死循环：同一offset+文本被连续插入
+    if (this.lastInsertAttempt && this.lastInsertAttempt.offset === offset && this.lastInsertAttempt.text === text) {
+      this.repeatedInsertCount++;
+      this.logger.info(`[INSERT] Repeated insert attempt #${this.repeatedInsertCount} for ${charDesc} at offset ${offset}`);
+      if (this.repeatedInsertCount >= this.maxRepeatedInsertAttempts) {
+        const errorMsg = `检测到死循环：同一内容(${charDesc})在 offset=${offset} 连续插入 ${this.repeatedInsertCount} 次。已停止插入以保护文档。`;
+        this.logger.info(`[INSERT LOOP DETECTED] ${errorMsg}`);
+        await this.notifications.warning(`DemoTyper: ${errorMsg}\n\n请检查目标文件格式是否正确，或尝试使用 Restore Current File 命令重置文档状态。`);
+        this.lastInsertAttempt = undefined;
+        this.repeatedInsertCount = 0;
+        return false;
+      }
+    } else {
+      this.repeatedInsertCount = 0;
+      this.lastInsertAttempt = { offset, text };
+    }
+
+    // 检测死循环：同一offset被频繁插入
+    const recentSameOffset = this.insertHistory.filter(
+      (h) => h.offset === offset && now - h.timestamp < 5000
+    );
+
+    this.logger.info(`[INSERT] History check: offset=${offset} has been inserted ${recentSameOffset.length} times in last 5 seconds`);
+
+    if (recentSameOffset.length >= 3) {
+      // 触发保护机制
+      const errorMsg = `检测到死循环：同一位置(offset=${offset})在5秒内被重复插入${recentSameOffset.length}次。已停止插入以保护文档。`;
+      this.logger.info(`[INSERT LOOP DETECTED] ${errorMsg}`);
+      this.logger.info(`[INSERT LOOP DETECTED] Insert history (last 10): ${JSON.stringify(this.insertHistory.slice(-10))}`);
+
+      await this.notifications.warning(`DemoTyper: ${errorMsg}\n\n请检查目标文件格式是否正确，或尝试使用 Restore Current File 命令重置文档状态。`);
+
+      // 清空历史记录，允许用户重试
+      this.insertHistory = [];
+      this.lastInsertAttempt = undefined;
+      this.repeatedInsertCount = 0;
+      return false;
+    }
+
+    const position = editor.document.positionAt(offset);
 
     this.logger.info(`[INSERT] At offset ${offset} (line ${position.line}, char ${position.character}), inserting: ${charDesc}, length: ${text.length}`);
     this.logger.info(`[INSERT] Document EOL: ${editor.document.eol === vscode.EndOfLine.CRLF ? 'CRLF' : 'LF'}`);
@@ -208,6 +257,14 @@ export class SmartReplaceHandler {
 
     this.logger.info(`[INSERT] Success, cursor at line ${nextPosition.line}, char ${nextPosition.character}`);
     this.logger.info(`[INSERT] Document length changed from ${beforeText.length} to ${afterText.length}`);
+
+    // 插入成功后记录到历史
+    this.insertHistory.push({ offset, text, timestamp: now });
+    if (this.insertHistory.length > 10) {
+      this.insertHistory.shift();
+    }
+    this.logger.info(`[INSERT] Recorded to history. History size: ${this.insertHistory.length}`);
+
     return true;
   }
 
@@ -404,39 +461,53 @@ export class SmartReplaceHandler {
             const nextTargetLine = targetLines[targetLineIndex + 1];
 
             if (nextCurrentLine !== nextTargetLine) {
-              // 下一行不匹配，向前查找：nextCurrentLine 是否匹配 target 的后续行
-              // 增加查找范围到10行，并使用灵活匹配（忽略尾部空白和注释）
-              let foundInLaterTarget = false;
-              let matchedTargetIndex = -1;
-              const maxLookAhead = 10;
-
-              for (let i = targetLineIndex + 2; i < Math.min(targetLineIndex + 2 + maxLookAhead, targetLines.length); i++) {
-                // 先尝试严格匹配，再尝试灵活匹配
-                if (currentLines[currentLineIndex + 1] === targetLines[i] ||
-                    this.linesEssentiallyMatch(currentLines[currentLineIndex + 1], targetLines[i])) {
-                  foundInLaterTarget = true;
-                  matchedTargetIndex = i;
-                  this.logger.info(`[DEBUG] Current[${currentLineIndex + 1}] matches Target[${i}] (distance: ${i - (targetLineIndex + 1)}), indicating Target[${targetLineIndex + 1}] is missing`);
-                  break;
-                }
-              }
-
-              if (foundInLaterTarget) {
-                // Current的下一行匹配Target的更后面的行，说明中间缺行
-                const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
-
-                // 获取目标文件下一行的前导空格（缩进）
-                const nextTargetLine = targetLines[targetLineIndex + 1];
-                const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
-
-                this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but next line mismatch indicates missing line`);
-                this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} spaces at offset ${originalOffset} to add missing line`);
-                return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+              const nextCurrentTrimmed = nextCurrentLine.trim();
+              // 如果当前下一行本身就是空白（仅缩进），不要触发向前查找。
+              // 这类空白行会在后续字符比对阶段逐步填充，避免误判导致重复插入换行。
+              if (nextCurrentTrimmed.length === 0) {
+                this.logger.info('[DEBUG] Next current line is whitespace only; skip lookahead to avoid duplicate newline insertion');
+              } else if (nextCurrentTrimmed.length < this.getLineEffectiveLength(nextTargetLine) * 0.5) {
+                // 当前下一行还远未达到目标行长度的一半，说明仍在逐字符填充，暂不触发向前查找
+                this.logger.info('[DEBUG] Next current line still under half of target content; skip lookahead to continue filling characters');
               } else {
-                // 没有在附近找到匹配，可能是大范围的行变化
-                // 不做处理，继续到下一轮逐字符比对
-                this.logger.info(`[DEBUG] Next line mismatch, but no nearby match found (checked ${maxLookAhead} lines ahead)`);
-                this.logger.info(`[DEBUG] Will continue with character-by-character comparison`);
+                // 下一行不匹配，向前查找：nextCurrentLine 是否匹配 target 的后续行
+                // 增加查找范围到10行，并使用灵活匹配（忽略尾部空白和注释）
+                let foundInLaterTarget = false;
+                let matchedTargetIndex = -1;
+                const maxLookAhead = 10;
+
+                for (let i = targetLineIndex + 2; i < Math.min(targetLineIndex + 2 + maxLookAhead, targetLines.length); i++) {
+                  const candidate = targetLines[i];
+                  if (candidate.trim().length === 0) {
+                    continue; // 空白行不参与向前匹配，避免无限插入空行
+                  }
+                  // 先尝试严格匹配，再尝试灵活匹配
+                  if (nextCurrentLine === candidate ||
+                      this.linesEssentiallyMatch(nextCurrentLine, candidate)) {
+                    foundInLaterTarget = true;
+                    matchedTargetIndex = i;
+                    this.logger.info(`[DEBUG] Current[${currentLineIndex + 1}] matches Target[${i}] (distance: ${i - (targetLineIndex + 1)}), indicating Target[${targetLineIndex + 1}] is missing`);
+                    break;
+                  }
+                }
+
+                if (foundInLaterTarget) {
+                  // Current的下一行匹配Target的更后面的行，说明中间缺行
+                  const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
+
+                  // 获取目标文件下一行的前导空格（缩进）
+                  const nextTargetLine = targetLines[targetLineIndex + 1];
+                  const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+
+                  this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but next line mismatch indicates missing line`);
+                  this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} spaces at offset ${originalOffset} to add missing line`);
+                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+                } else {
+                  // 没有在附近找到匹配，可能是大范围的行变化
+                  // 不做处理，继续到下一轮逐字符比对
+                  this.logger.info(`[DEBUG] Next line mismatch, but no nearby match found (checked ${maxLookAhead} lines ahead)`);
+                  this.logger.info(`[DEBUG] Will continue with character-by-character comparison`);
+                }
               }
             }
           } else {
@@ -552,8 +623,12 @@ export class SmartReplaceHandler {
               futureTargetIdx < Math.min(targetLineIndex + 1 + maxLookAhead, targetLines.length);
               futureTargetIdx++
             ) {
-              if (currentLine === targetLines[futureTargetIdx] ||
-                  this.linesEssentiallyMatch(currentLine, targetLines[futureTargetIdx])) {
+              const futureCandidate = targetLines[futureTargetIdx];
+              if (futureCandidate.trim().length === 0) {
+                continue; // 空白行不参与向前匹配，避免在空白块上重复插入换行
+              }
+              if (currentLine === futureCandidate ||
+                  this.linesEssentiallyMatch(currentLine, futureCandidate)) {
                 // 当前行匹配目标的后续行，说明目标的当前行在current中缺失
                 const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
                 const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
@@ -785,6 +860,13 @@ export class SmartReplaceHandler {
   }
 
   /**
+   * 计算一行的有效内容长度（忽略首尾空白）
+   */
+  private getLineEffectiveLength(line: string): number {
+    return line.trim().length;
+  }
+
+  /**
    * 比较两行是否"本质相同"，忽略尾部空白和单行注释差异
    * 用于向前查找时的灵活匹配
    */
@@ -853,10 +935,24 @@ export class SmartReplaceHandler {
     currentLines: string[],
     targetLines: string[]
   ): boolean {
-    // 条件1: 当前行和目标行的相似度很低（可能完全不同）
     const currentLine = currentLines[currentLineIndex] || '';
     const targetLine = targetLines[targetLineIndex];
 
+    // 如果当前行本身是空白，说明我们只是在填充缩进或新行，不应该触发块删除逻辑
+    if (currentLine.trim().length === 0) {
+      this.logger.info('[DEBUG] Current line is whitespace only; skip block-deletion detection');
+      return false;
+    }
+
+    // 如果当前行的有效内容长度不到目标行的一半，说明尚在逐字符填充，不触发块删除逻辑
+    const currentEffectiveLen = this.getLineEffectiveLength(currentLine);
+    const targetEffectiveLen = this.getLineEffectiveLength(targetLine);
+    if (targetEffectiveLen > 0 && currentEffectiveLen < targetEffectiveLen * 0.5) {
+      this.logger.info('[DEBUG] Current line content still under half of target; skip block-deletion detection');
+      return false;
+    }
+
+    // 条件1: 当前行和目标行的相似度很低（可能完全不同）
     // 条件2: 检查目标文件是否有多行内容，而当前文件缺少这些行
     // 通过"向前查找"检测：当前行是否匹配目标文件后面的某行
     const maxLookAhead = 15; // 查找范围增加到15行，覆盖更多场景
