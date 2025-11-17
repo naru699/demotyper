@@ -1,0 +1,129 @@
+{
+  "name": "demotyper",
+  "displayName": "DemoTyper",
+  "description": "A VS Code / Cursor extension that simulates live coding demos via a secret typing mode.",
+  "version": "1.1.0",
+  "publisher": "demotyper",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Education",
+    "Other"
+  ],
+  "keywords": [
+    "demo",
+    "presentation",
+    "teaching",
+    "typing"
+  ],
+  "activationEvents": [
+    "onCommand:demotyper.toggleSecretMode",
+    "onCommand:demotyper.setAsTargetFile",
+    "onCommand:demotyper.clearTargetFile",
+    "onCommand:demotyper.restoreCurrentFile",
+    "onCommand:demotyper.jumpToNextGap",
+    "onCommand:demotyper.showDebugInfo"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "demotyper.views",
+          "title": "DemoTyper",
+          "icon": "resources/demotyper.svg"
+        }
+      ]
+    },
+    "views": {
+      "demotyper.views": [
+        {
+          "id": "demotyper.panel",
+          "name": "DemoTyper 面板"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "demotyper.toggleSecretMode",
+        "title": "DemoTyper: Toggle Secret Mode"
+      },
+      {
+        "command": "demotyper.setAsTargetFile",
+        "title": "DemoTyper: Set as Demo Target File"
+      },
+      {
+        "command": "demotyper.clearTargetFile",
+        "title": "DemoTyper: Clear Demo Target File"
+      },
+      {
+        "command": "demotyper.restoreCurrentFile",
+        "title": "DemoTyper: Restore Editor from Target File"
+      },
+      {
+        "command": "demotyper.jumpToNextGap",
+        "title": "DemoTyper: Jump to Next Difference"
+      },
+      {
+        "command": "demotyper.showDebugInfo",
+        "title": "DemoTyper: Show Debug Info (显示调试信息)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "demotyper.setAsTargetFile",
+          "group": "navigation@5"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "demotyper.toggleSecretMode",
+        "key": "ctrl+shift+alt+s",
+        "mac": "cmd+shift+alt+s",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "DemoTyper",
+      "properties": {
+        "demotyper.enableLogging": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable verbose debug logging in the DemoTyper output channel."
+        },
+        "demotyper.notifications.muteGuidance": {
+          "type": "boolean",
+          "default": false,
+          "description": "Silence DemoTyper pop-up guidance/warning messages during secret mode."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -p ./ -w",
+    "lint": "echo \"No linting configured\"",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.75.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.7.0",
+    "glob": "^11.0.3",
+    "mocha": "^11.7.5",
+    "typescript": "^5.4.5"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://example.com/demotyper.git"
+  }
+}
