@@ -495,28 +495,13 @@ export class SmartReplaceHandler {
                   // Current的下一行匹配Target的更后面的行，说明中间缺行
                   const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
 
-                  // 计算缺失的行数
                   const missingLineCount = matchedTargetIndex - (targetLineIndex + 1);
-
                   this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but next line mismatch indicates ${missingLineCount} missing line(s)`);
                   this.logger.info(`[DEBUG] Current next line matches Target[${matchedTargetIndex}], so Target[${targetLineIndex + 1}] to Target[${matchedTargetIndex - 1}] are missing`);
 
-                  // 批量插入：一次性插入所有缺失的换行符和缩进
-                  if (missingLineCount > 1) {
-                    let bulkNewlines = '';
-                    for (let i = targetLineIndex + 1; i < matchedTargetIndex; i++) {
-                      const indent = this.getLeadingSpaces(targetLines[i]);
-                      bulkNewlines += '\n' + indent;
-                    }
-                    this.logger.info(`[BULK INSERT] Inserting ${missingLineCount} newlines at once at offset ${originalOffset}`);
-                    return { state: 'gap', insertOffset: originalOffset, nextChar: bulkNewlines };
-                  } else {
-                    // 只缺失1行，单行插入
-                    const nextTargetLine = targetLines[targetLineIndex + 1];
-                    const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
-                    this.logger.info(`[DEBUG] Insert single newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
-                    return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
-                  }
+                  // 逐字符插入：插入换行符，让后续逐字符填充缩进和内容
+                  this.logger.info(`[DEBUG] Insert newline at offset ${originalOffset}, will fill content char-by-char`);
+                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
                 } else {
                   // 没有在附近找到匹配，可能是大范围的行变化
                   // 不做处理，继续到下一轮逐字符比对
@@ -584,21 +569,9 @@ export class SmartReplaceHandler {
 
         this.logger.info(`[DEBUG] Block deletion: Current[${currentLineIndex}] matches Target[${matchedTargetIndex}], missing ${missingLineCount} lines`);
 
-        // 批量插入：一次性插入所有缺失的换行符和缩进
-        if (missingLineCount > 1) {
-          let bulkNewlines = '';
-          for (let i = targetLineIndex; i < matchedTargetIndex; i++) {
-            const indent = this.getLeadingSpaces(targetLines[i]);
-            bulkNewlines += '\n' + indent;
-          }
-          this.logger.info(`[BULK INSERT] Block deletion: Inserting ${missingLineCount} newlines at once at offset ${originalOffset}`);
-          return { state: 'gap', insertOffset: originalOffset, nextChar: bulkNewlines };
-        } else {
-          // 只缺失1行，单行插入
-          const leadingSpaces = this.getLeadingSpaces(targetLine);
-          this.logger.info(`[DEBUG] Block deletion: Insert single newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
-          return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
-        }
+        // 逐字符插入：先插入换行符，后续逐字符填充缩进和内容
+        this.logger.info(`[DEBUG] Block deletion: Insert newline at offset ${originalOffset}, will fill content char-by-char`);
+        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
       }
 
       // 检测是否需要插入新行（行数不匹配的情况）
@@ -678,27 +651,14 @@ export class SmartReplaceHandler {
                 const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
                 const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
 
-                // 计算缺失的行数
                 const missingLineCount = futureTargetIdx - targetLineIndex;
 
                 this.logger.info(`[DEBUG] Forward lookup: Current[${currentLineIndex}] matches Target[${futureTargetIdx}] (distance: ${missingLineCount})`);
                 this.logger.info(`[DEBUG] This means Target[${targetLineIndex}] to Target[${futureTargetIdx - 1}] are missing (${missingLineCount} lines)`);
 
-                // 批量插入：一次性插入所有缺失的换行符和缩进
-                if (missingLineCount > 1) {
-                  let bulkNewlines = '';
-                  for (let i = targetLineIndex; i < futureTargetIdx; i++) {
-                    const indent = this.getLeadingSpaces(targetLines[i]);
-                    bulkNewlines += '\n' + indent;
-                  }
-                  this.logger.info(`[BULK INSERT] Inserting ${missingLineCount} newlines at once at offset ${originalOffset}`);
-                  return { state: 'gap', insertOffset: originalOffset, nextChar: bulkNewlines };
-                } else {
-                  // 只缺失1行，单行插入
-                  const leadingSpaces = this.getLeadingSpaces(targetLine);
-                  this.logger.info(`[DEBUG] Insert single newline + ${leadingSpaces.length} indent chars before current line at offset ${originalOffset}`);
-                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
-                }
+                // 逐字符插入：先插入换行符，后续逐字符填充缩进和内容
+                this.logger.info(`[DEBUG] Forward lookup: Insert newline at offset ${originalOffset}, will fill content char-by-char`);
+                return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
               }
             }
           }
