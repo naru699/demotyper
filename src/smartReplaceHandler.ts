@@ -437,10 +437,13 @@ export class SmartReplaceHandler {
         const insertOffset = normalizedCurrent.length;
         const originalOffset = this.mapNormalizedToOriginal(insertOffset, currentMapping);
 
-        this.logger.info(`[DEBUG] Need to append line ${targetLineIndex}: "${targetLine}"`);
-        this.logger.info(`[DEBUG] Insert newline at offset ${originalOffset}`);
+        // 获取目标行的缩进
+        const leadingSpaces = this.getLeadingSpaces(targetLine);
 
-        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+        this.logger.info(`[DEBUG] Need to append line ${targetLineIndex}: "${targetLine}"`);
+        this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+
+        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
       }
 
       const currentLine = currentLines[currentLineIndex];
@@ -499,9 +502,11 @@ export class SmartReplaceHandler {
                   this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but next line mismatch indicates ${missingLineCount} missing line(s)`);
                   this.logger.info(`[DEBUG] Current next line matches Target[${matchedTargetIndex}], so Target[${targetLineIndex + 1}] to Target[${matchedTargetIndex - 1}] are missing`);
 
-                  // 逐字符插入：插入换行符，让后续逐字符填充缩进和内容
-                  this.logger.info(`[DEBUG] Insert newline at offset ${originalOffset}, will fill content char-by-char`);
-                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+                  // 插入换行符 + 缺失行的缩进
+                  const nextTargetLine = targetLines[targetLineIndex + 1];
+                  const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+                  this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
                 } else {
                   // 没有在附近找到匹配，可能是大范围的行变化
                   // 不做处理，继续到下一轮逐字符比对
@@ -519,7 +524,7 @@ export class SmartReplaceHandler {
             const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
 
             this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but need to append more lines`);
-            this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} spaces at offset ${originalOffset}`);
+            this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
             return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
           }
         }
@@ -569,9 +574,10 @@ export class SmartReplaceHandler {
 
         this.logger.info(`[DEBUG] Block deletion: Current[${currentLineIndex}] matches Target[${matchedTargetIndex}], missing ${missingLineCount} lines`);
 
-        // 逐字符插入：先插入换行符，后续逐字符填充缩进和内容
-        this.logger.info(`[DEBUG] Block deletion: Insert newline at offset ${originalOffset}, will fill content char-by-char`);
-        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+        // 插入换行符 + 目标行的缩进
+        const leadingSpaces = this.getLeadingSpaces(targetLine);
+        this.logger.info(`[DEBUG] Block deletion: Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
       }
 
       // 检测是否需要插入新行（行数不匹配的情况）
@@ -602,14 +608,44 @@ export class SmartReplaceHandler {
       }
       // 情况2: 当前不是空行，且和目标行内容差异很大 → 需要在当前行前插入新行
       else if (!isCurrentEmpty && !isTargetEmpty) {
+        // 首先检查行开头是否匹配(去除缩进后)
+        const currentTrimmed = currentLine.trim();
+        const targetTrimmed = targetLine.trim();
+
+        // ⚠️ 重要: 只有当前行有实际内容时才做前缀检查
+        // 如果当前行只有缩进(没有实际内容),说明是刚插入的空行,应该继续填充,不要再次插入换行
+        if (currentTrimmed.length > 0) {
+          // 检查开头字符是否匹配(至少前3个字符或整个较短字符串)
+          const checkLen = Math.min(3, currentTrimmed.length, targetTrimmed.length);
+          const currentPrefix = currentTrimmed.substring(0, checkLen);
+          const targetPrefix = targetTrimmed.substring(0, checkLen);
+
+          if (checkLen > 0 && currentPrefix !== targetPrefix) {
+            // 行开头就不匹配,说明是完全不同的行,需要在当前行前插入新行
+            const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+            const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
+
+            this.logger.info(`[DEBUG] Line prefix mismatch (current: "${currentPrefix}", target: "${targetPrefix}")`);
+            this.logger.info(`[DEBUG] Current line: "${currentLine}"`);
+            this.logger.info(`[DEBUG] Target line: "${targetLine}"`);
+            this.logger.info(`[DEBUG] Insert newline before current line at offset ${originalOffset}`);
+
+            // ⚠️ 重要: 只插入 '\n',不带缩进!
+            // 因为我们插入的位置是当前行的行首,当前行已经有自己的缩进
+            // 如果插入 '\n' + leadingSpaces,会导致当前行的缩进累加(双重缩进BUG)
+            // 新行的缩进会在后续的逐字符插入中自然填充
+            return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+          }
+        }
+
         // 只有当前行长度达到目标行长度的50%以上时，才做相似度检测
         // 否则可能是正在填充中的行，应该继续填充
         const currentTrimmedLen = currentLine.trim().length;
         const targetTrimmedLen = targetLine.trim().length;
 
         if (currentTrimmedLen < targetTrimmedLen * 0.5) {
-          // 当前行太短，可能还在填充中，继续往下执行逐字符比对
-          this.logger.info(`[DEBUG] Current line is still short (${currentTrimmedLen} < ${targetTrimmedLen * 0.5}), continue filling`);
+          // 当前行太短，但开头匹配，可能还在填充中，继续往下执行逐字符比对
+          this.logger.info(`[DEBUG] Current line is still short (${currentTrimmedLen} < ${targetTrimmedLen * 0.5}), but prefix matches, continue filling`);
         } else {
           // 当前行已经有足够长度，进行相似度检测
           // 使用LCS算法计算相似度（对小的插入/删除更鲁棒）
@@ -656,9 +692,10 @@ export class SmartReplaceHandler {
                 this.logger.info(`[DEBUG] Forward lookup: Current[${currentLineIndex}] matches Target[${futureTargetIdx}] (distance: ${missingLineCount})`);
                 this.logger.info(`[DEBUG] This means Target[${targetLineIndex}] to Target[${futureTargetIdx - 1}] are missing (${missingLineCount} lines)`);
 
-                // 逐字符插入：先插入换行符，后续逐字符填充缩进和内容
-                this.logger.info(`[DEBUG] Forward lookup: Insert newline at offset ${originalOffset}, will fill content char-by-char`);
-                return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+                // 插入换行符 + 目标行的缩进
+                const leadingSpaces = this.getLeadingSpaces(targetLine);
+                this.logger.info(`[DEBUG] Forward lookup: Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+                return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
               }
             }
           }
@@ -680,17 +717,7 @@ export class SmartReplaceHandler {
 
           // 如果目标字符不存在（目标行已结束），但当前字符存在，说明当前行比目标行长
           if (targetChar === undefined && currentChar !== undefined) {
-            // 检查是否已经完全匹配了目标行的全部内容
-            if (charIdx === targetLine.length && targetLineIndex < targetLines.length - 1) {
-              // 已经完全匹配目标行，且目标文件后面还有更多行
-              // 说明当前行多出的内容应该在下一行，需要插入换行符
-              this.logger.info(`[DEBUG] Current line has extra content after matching target line completely`);
-              this.logger.info(`[DEBUG] Extra content: "${currentLine.substring(charIdx)}"`);
-              this.logger.info(`[DEBUG] Insert newline at offset ${originalOffset}`);
-              return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
-            }
-
-            // 否则是真正的不同步情况
+            // 当前行比目标行长，这是不同步的情况
             this.logger.info(`[DEBUG] Current line is longer than target line at pos ${charIdx} (mismatch)`);
             this.logger.info(`[DEBUG] Current has extra content: "${currentLine.substring(charIdx)}"`);
             return { state: 'mismatch', offset: originalOffset };
@@ -716,10 +743,14 @@ export class SmartReplaceHandler {
         const lineEndOffset = lineStartOffset + targetLine.length;
         const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
 
-        this.logger.info(`[DEBUG] Line ${targetLineIndex} content filled, need to insert newline`);
-        this.logger.info(`[DEBUG] Insert newline at offset ${originalOffset}`);
+        // 获取下一行的缩进
+        const nextTargetLine = targetLines[targetLineIndex + 1];
+        const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
 
-        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+        this.logger.info(`[DEBUG] Line ${targetLineIndex} content filled, need to insert newline`);
+        this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+
+        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
       }
 
       currentLineIndex++;
