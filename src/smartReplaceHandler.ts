@@ -6,8 +6,8 @@ import { NotificationManager } from './notificationManager';
 
 export class SmartReplaceHandler {
   private documentSnapshot?: { version: number; text: string };
-  private insertHistory: Array<{ offset: number; text: string; timestamp: number }> = [];
-  private lastInsertAttempt?: { offset: number; text: string };
+  private insertHistory: Array<{ offset: number; text: string; deleteCount: number; timestamp: number }> = [];
+  private lastInsertAttempt?: { offset: number; text: string; deleteCount: number };
   private repeatedInsertCount = 0;
   private readonly maxRepeatedInsertAttempts = 3;
 
@@ -39,14 +39,26 @@ export class SmartReplaceHandler {
       return 'outOfSync';
     }
 
-    const { insertOffset, nextChar } = analysis;
+    const { insertOffset, nextChar, cursorBackOffset, deleteCount } = analysis;
 
     const editOptions = editOptionsFactory();
 
     // 将要插入的字符转换为文档的 EOL 格式
     const textToInsert = this.convertToDocumentEOL(editor, nextChar);
+    const adjustedCursorBackOffset = this.adjustCursorBackOffsetForEOL(
+      nextChar,
+      textToInsert,
+      cursorBackOffset,
+    );
 
-    const inserted = await this.insertAt(editor, insertOffset, textToInsert, editOptions);
+    const inserted = await this.insertAt(
+      editor,
+      insertOffset,
+      textToInsert,
+      editOptions,
+      adjustedCursorBackOffset,
+      deleteCount,
+    );
     if (!inserted) {
       return 'outOfSync';
     }
@@ -153,12 +165,53 @@ export class SmartReplaceHandler {
     offset: number,
     text: string,
     editOptions: UndoFriendlyEditOptions,
+    cursorBackOffset?: number,
+    deleteCount = 0,
   ): Promise<boolean> {
-    const charDesc = this.getCharDescription(text);
+    let insertText = text;
+    let effectiveCursorBackOffset = cursorBackOffset;
+    const position = editor.document.positionAt(offset);
+
+    if (deleteCount === 0 && effectiveCursorBackOffset === undefined) {
+      const pairInfo = this.getAutoPairInsertion(text);
+      if (pairInfo) {
+        insertText = pairInfo.text;
+        effectiveCursorBackOffset = pairInfo.cursorBackOffset;
+        this.logger.info(`[CROSS-LINE DEBUG] After auto-pair, char='${text}', next='${insertText}', cursorBack=${effectiveCursorBackOffset}`);
+      }
+    }
+
+    const visibleInput = text.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+    const visibleInsert = insertText.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+    this.logger.info(
+      `[AUTO-PAIR DEBUG] input='${visibleInput}', insert='${visibleInsert}', cursorBack=${effectiveCursorBackOffset ?? 0}`,
+    );
+
+    if (insertText.includes('\n')) {
+      const segments = insertText
+        .split('\n')
+        .map((line, index) => `line${index}="${line.replace(/ /g, '_') || ''}"`);
+      const previousInsert = this.insertHistory[this.insertHistory.length - 1];
+      const previousVisible = previousInsert
+        ? previousInsert.text.replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+        : 'n/a';
+      this.logger.info(
+        `[CROSS-LINE DEBUG] Multi-line insert after '${visibleInput}', segments (spaces as '_'): ${segments.join(
+          ' | ',
+        )}, prevInsert='${previousVisible}', offset=${offset}, deleteCount=${deleteCount}`,
+      );
+    }
+
+    const charDesc = this.getCharDescription(insertText);
     const now = Date.now();
 
     // 检测死循环：同一offset+文本被连续插入
-    if (this.lastInsertAttempt && this.lastInsertAttempt.offset === offset && this.lastInsertAttempt.text === text) {
+    if (
+      this.lastInsertAttempt &&
+      this.lastInsertAttempt.offset === offset &&
+      this.lastInsertAttempt.text === insertText &&
+      this.lastInsertAttempt.deleteCount === deleteCount
+    ) {
       this.repeatedInsertCount++;
       this.logger.info(`[INSERT] Repeated insert attempt #${this.repeatedInsertCount} for ${charDesc} at offset ${offset}`);
       if (this.repeatedInsertCount >= this.maxRepeatedInsertAttempts) {
@@ -171,12 +224,12 @@ export class SmartReplaceHandler {
       }
     } else {
       this.repeatedInsertCount = 0;
-      this.lastInsertAttempt = { offset, text };
+      this.lastInsertAttempt = { offset, text: insertText, deleteCount };
     }
 
     // 检测死循环：同一offset被频繁插入
     const recentSameOffset = this.insertHistory.filter(
-      (h) => h.offset === offset && now - h.timestamp < 5000
+      (h) => h.offset === offset && h.text === insertText && h.deleteCount === deleteCount && now - h.timestamp < 5000
     );
 
     this.logger.info(`[INSERT] History check: offset=${offset} has been inserted ${recentSameOffset.length} times in last 5 seconds`);
@@ -196,9 +249,11 @@ export class SmartReplaceHandler {
       return false;
     }
 
-    const position = editor.document.positionAt(offset);
+    const deleteCountInfo = deleteCount > 0 ? `, deleteCount=${deleteCount}` : '';
 
-    this.logger.info(`[INSERT] At offset ${offset} (line ${position.line}, char ${position.character}), inserting: ${charDesc}, length: ${text.length}`);
+    this.logger.info(
+      `[INSERT] At offset ${offset} (line ${position.line}, char ${position.character}), inserting: ${charDesc}, length: ${insertText.length}${deleteCountInfo}`,
+    );
     this.logger.info(`[INSERT] Document EOL: ${editor.document.eol === vscode.EndOfLine.CRLF ? 'CRLF' : 'LF'}`);
 
     // 记录插入前文档内容的片段
@@ -206,9 +261,14 @@ export class SmartReplaceHandler {
     const beforePreview = this.getContentPreview(beforeText.substring(Math.max(0, offset - 10), offset + 20), 50);
     this.logger.info(`[INSERT] Before insert, around offset: "${beforePreview}"`);
 
+    const deleteEndPosition = deleteCount > 0 ? editor.document.positionAt(offset + deleteCount) : position;
     const applied = await editor.edit(
       (editBuilder) => {
-        editBuilder.insert(position, text);
+        if (deleteCount > 0) {
+          editBuilder.replace(new vscode.Range(position, deleteEndPosition), insertText);
+        } else {
+          editBuilder.insert(position, insertText);
+        }
       },
       editOptions,
     );
@@ -223,43 +283,35 @@ export class SmartReplaceHandler {
     const afterPreview = this.getContentPreview(afterText.substring(Math.max(0, offset - 10), offset + 30), 60);
     this.logger.info(`[INSERT] After insert, around offset: "${afterPreview}"`);
 
-    // 在插入后，基于实际的文档内容计算新的光标位置
-    let nextPosition: vscode.Position;
+    const actualInsertedLength = this.calculateInsertedLength(insertText, editor.document.eol);
+    const defaultNewOffset = offset + actualInsertedLength;
+    const normalizedBackOffset = effectiveCursorBackOffset ? Math.min(effectiveCursorBackOffset, actualInsertedLength) : 0;
+    const finalCursorOffset = Math.max(offset, defaultNewOffset - normalizedBackOffset);
 
-    // 特殊处理包含换行符的文本：需要正确计算光标在哪一行哪一列
-    if (text.includes('\n')) {
-      // 获取插入位置
+    if (insertText.includes('\n')) {
       const insertPosition = editor.document.positionAt(offset);
-
-      // 计算插入的文本中有多少个换行符
-      const lines = text.split('\n');
+      const lines = insertText.split('\n');
       const newlineCount = lines.length - 1;
-
-      // 新行号 = 插入位置的行号 + 换行符数量
-      const newLineNumber = insertPosition.line + newlineCount;
-
-      // 光标应该在最后一行内容的末尾
-      // 例如: 插入 "\n    " 应该让光标在新行的第4列（4个空格后）
       const lastLineContent = lines[lines.length - 1];
-      const newCharacter = lastLineContent.length;
-
-      this.logger.info(`[INSERT] Inserted text with ${newlineCount} newline(s), cursor will be at line ${newLineNumber}, char ${newCharacter}`);
-      nextPosition = new vscode.Position(newLineNumber, newCharacter);
+      this.logger.info(
+        `[INSERT] Inserted text with ${newlineCount} newline(s), cursor default at line ${insertPosition.line + newlineCount}, char ${lastLineContent.length}`,
+      );
     } else {
-      // 其他字符：光标在插入文本之后
-      const actualInsertedLength = this.calculateInsertedLength(text, editor.document.eol);
-      const newOffset = offset + actualInsertedLength;
-      nextPosition = editor.document.positionAt(newOffset);
-      this.logger.info(`[INSERT] Text length: ${text.length}, actual inserted: ${actualInsertedLength}, new offset: ${newOffset}`);
+      this.logger.info(`[INSERT] Text length: ${text.length}, actual inserted: ${actualInsertedLength}, new offset: ${defaultNewOffset}`);
     }
 
+    if (normalizedBackOffset > 0) {
+      this.logger.info(`[INSERT] Moving cursor back by ${normalizedBackOffset} character(s) to align with smart snippet target`);
+    }
+
+    const nextPosition = editor.document.positionAt(finalCursorOffset);
     editor.selection = new vscode.Selection(nextPosition, nextPosition);
 
     this.logger.info(`[INSERT] Success, cursor at line ${nextPosition.line}, char ${nextPosition.character}`);
     this.logger.info(`[INSERT] Document length changed from ${beforeText.length} to ${afterText.length}`);
 
     // 插入成功后记录到历史
-    this.insertHistory.push({ offset, text, timestamp: now });
+    this.insertHistory.push({ offset, text: insertText, deleteCount, timestamp: now });
     if (this.insertHistory.length > 10) {
       this.insertHistory.shift();
     }
@@ -278,6 +330,22 @@ export class SmartReplaceHandler {
     // 2. 如果我们插入的是\r\n，文档是CRLF，长度=2
     // 3. convertToDocumentEOL已经处理了转换，所以text已经是正确的格式
     return text.length;
+  }
+
+  /**
+   * 将规范化文本中的删除长度转换为原始文本中的字符数
+   */
+  private calculateDeleteCountFromNormalized(
+    normalizedStart: number,
+    normalizedLength: number,
+    mapping: number[],
+  ): number {
+    if (normalizedLength <= 0) {
+      return 0;
+    }
+    const startOriginal = this.mapNormalizedToOriginal(normalizedStart, mapping);
+    const endOriginal = this.mapNormalizedToOriginal(normalizedStart + normalizedLength, mapping);
+    return Math.max(0, endOriginal - startOriginal);
   }
 
   private getDocumentText(editor: vscode.TextEditor): string {
@@ -363,7 +431,7 @@ export class SmartReplaceHandler {
     target: string,
   ):
     | { state: 'inSync' }
-    | { state: 'gap'; insertOffset: number; nextChar: string }
+    | { state: 'gap'; insertOffset: number; nextChar: string; cursorBackOffset?: number; deleteCount?: number }
     | { state: 'mismatch'; offset: number } {
     // 规范化换行符
     const normalizedCurrent = this.normalizeLineEndings(current);
@@ -381,6 +449,25 @@ export class SmartReplaceHandler {
 
     // 创建偏移量映射
     const currentMapping = this.createOffsetMapping(current);
+
+    // 如果检测到占位符行（例如 [DELETED] 标记），优先删除
+    const placeholderLineIndex = currentLines.findIndex((line) => this.isPlaceholderDeletionLine(line));
+    if (placeholderLineIndex !== -1) {
+      const placeholderStartOffset = this.getLineStartOffset(normalizedCurrent, placeholderLineIndex);
+      const originalOffset = this.mapNormalizedToOriginal(placeholderStartOffset, currentMapping);
+      const deleteCount = this.calculateDeleteCountFromNormalized(
+        placeholderStartOffset,
+        currentLines[placeholderLineIndex].length,
+        currentMapping,
+      );
+      this.logger.info(`[DEBUG] Found placeholder line at index ${placeholderLineIndex}, removing it before continuing`);
+      return {
+        state: 'gap',
+        insertOffset: originalOffset,
+        nextChar: '',
+        deleteCount: deleteCount > 0 ? deleteCount : undefined,
+      };
+    }
 
     // 逐行比对
     let currentLineIndex = 0;
@@ -539,6 +626,19 @@ export class SmartReplaceHandler {
       this.logger.info(`[DEBUG] Line ${targetLineIndex} mismatch:`);
       this.logger.info(`[DEBUG]   Current[${currentLineIndex}]: "${currentLine}"`);
       this.logger.info(`[DEBUG]   Target[${targetLineIndex}]: "${targetLine}"`);
+
+      if (this.isPlaceholderDeletionLine(currentLine)) {
+        const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+        const originalOffset = this.mapNormalizedToOriginal(lineStartOffset, currentMapping);
+        const deleteCount = this.calculateDeleteCountFromNormalized(lineStartOffset, currentLine.length, currentMapping);
+        this.logger.info(`[DEBUG] Placeholder marker detected at line ${currentLineIndex}, deleting placeholder line before inserting target content`);
+        return {
+          state: 'gap',
+          insertOffset: originalOffset,
+          nextChar: '',
+          deleteCount: deleteCount > 0 ? deleteCount : undefined,
+        };
+      }
 
       // 特殊处理：检测是否删除了代码块（如if{}, for{}, while{}等）
       // 这种情况下，目标有多行内容，但当前只有一行闭合符号
@@ -715,8 +815,13 @@ export class SmartReplaceHandler {
           const charOffset = lineStartOffset + charIdx;
           const originalOffset = this.mapNormalizedToOriginal(charOffset, currentMapping);
 
-          // 如果目标字符不存在（目标行已结束），但当前字符存在，说明当前行比目标行长
           if (targetChar === undefined && currentChar !== undefined) {
+            if (this.isAutoPairClosingChar(currentChar)) {
+              this.logger.info(
+                `[DEBUG] Skipping auto-paired closing char '${currentChar}' at line ${targetLineIndex}, pos ${charIdx} to allow target to catch up`,
+              );
+              continue;
+            }
             // 当前行比目标行长，这是不同步的情况
             this.logger.info(`[DEBUG] Current line is longer than target line at pos ${charIdx} (mismatch)`);
             this.logger.info(`[DEBUG] Current has extra content: "${currentLine.substring(charIdx)}"`);
@@ -724,8 +829,6 @@ export class SmartReplaceHandler {
           }
 
           let nextChar = targetChar || '';
-
-          // 直接返回需要插入的字符，不做特殊处理
 
           const charDesc = this.getCharDescription(nextChar);
 
@@ -855,7 +958,7 @@ export class SmartReplaceHandler {
   ):
     | { state: 'inSync' }
     | { state: 'mismatch'; offset: number }
-    | { state: 'gap'; insertOffset: number; nextChar: string } {
+    | { state: 'gap'; insertOffset: number; nextChar: string; cursorBackOffset?: number; deleteCount?: number } {
     // 使用新的子序列匹配算法
     const result = this.computeNextGap(current, target);
 
@@ -875,6 +978,13 @@ export class SmartReplaceHandler {
     return cursorOffset === offset;
   }
 
+  private isAutoPairClosingChar(char: string): boolean {
+    if (!char || char.length !== 1) {
+      return false;
+    }
+    return ')]}\'"`'.includes(char);
+  }
+
   /**
    * 将换行符转换为文档的 EOL 格式
    * 支持包含换行符的字符串（如 "\n    "）
@@ -891,6 +1001,28 @@ export class SmartReplaceHandler {
       return char.replace(/\n/g, '\r\n');
     }
     return char;
+  }
+
+  private adjustCursorBackOffsetForEOL(
+    originalText: string,
+    convertedText: string,
+    cursorBackOffset?: number,
+  ): number | undefined {
+    if (!cursorBackOffset || cursorBackOffset <= 0) {
+      return cursorBackOffset;
+    }
+
+    if (originalText === convertedText) {
+      return cursorBackOffset;
+    }
+
+    const clamped = Math.min(cursorBackOffset, originalText.length);
+    const desiredIndex = Math.max(0, originalText.length - clamped);
+    const beforeCursor = originalText.substring(0, desiredIndex);
+    const newlineBeforeCursor = (beforeCursor.match(/\n/g)?.length ?? 0);
+    const adjustedIndex = desiredIndex + newlineBeforeCursor;
+    const adjustedCursorBack = Math.max(0, convertedText.length - adjustedIndex);
+    return adjustedCursorBack;
   }
 
   private isEnterKeypress(typedText: string | undefined): boolean {
@@ -933,6 +1065,10 @@ export class SmartReplaceHandler {
     const withoutComment2 = trimmed2.replace(/\s*(\/\/|#|\/\*).*$/, '').trimEnd();
 
     return withoutComment1 === withoutComment2;
+  }
+
+  private isPlaceholderDeletionLine(line: string): boolean {
+    return /\[DELETED\]/.test(line);
   }
 
   /**
@@ -1107,5 +1243,128 @@ export class SmartReplaceHandler {
 
     // 相似度 = LCS长度 / 较长字符串的长度
     return lcs / longerLen;
+  }
+
+  private getAutoPairInsertion(input: string): { text: string; cursorBackOffset: number } | undefined {
+    if (input.length !== 1) {
+      return undefined;
+    }
+    const char = input[0];
+    switch (char) {
+      case '{':
+        return { text: '{}', cursorBackOffset: 1 };
+      case '(': 
+        return { text: '()', cursorBackOffset: 1 };
+      case '[':
+        return { text: '[]', cursorBackOffset: 1 };
+      case '\'':
+        return { text: '\'\'', cursorBackOffset: 1 };
+      case '"':
+        return { text: '""', cursorBackOffset: 1 };
+      case '`':
+        return { text: '``', cursorBackOffset: 1 };
+      default:
+        return undefined;
+    }
+  }
+
+
+  private findMatchingBracket(text: string, startIndex: number, openChar: string, closeChar: string): number | undefined {
+    if (startIndex >= text.length || text[startIndex] !== openChar) {
+      return undefined;
+    }
+
+    if (openChar === closeChar) {
+      for (let i = startIndex + 1; i < text.length; i++) {
+        const char = text[i];
+        if (char === '\\') {
+          i++;
+          continue;
+        }
+        if (char === closeChar) {
+          return i;
+        }
+        if (char === '\n') {
+          break;
+        }
+      }
+      return undefined;
+    }
+
+    let depth = 0;
+    for (let i = startIndex; i < text.length; i++) {
+      const char = text[i];
+      if (char === openChar) {
+        depth++;
+      } else if (char === closeChar) {
+        depth--;
+        if (depth === 0) {
+          return i;
+        }
+      } else if (char === '"' || char === '\'') {
+        const quoteEnd = this.findMatchingBracket(text, i, char, char);
+        if (quoteEnd !== undefined) {
+          i = quoteEnd;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private findBraceAfterParenthesis(
+    text: string,
+    startIndex: number,
+  ): { braceIndex: number; betweenText: string } | undefined {
+    let i = startIndex;
+    let between = '';
+    while (i < text.length) {
+      const char = text[i];
+      if (char === '{') {
+        return { braceIndex: i, betweenText: between };
+      }
+      if (char === '=') {
+        if (text[i + 1] === '>') {
+          between += '=>';
+          i += 2;
+          continue;
+        }
+        return undefined;
+      }
+      if (char === '\n' || char === '\t' || char === ' ') {
+        between += char;
+        i++;
+        continue;
+      }
+      if (/[A-Za-z0-9_<>\[\]\?\!\:\.\,\|&]/.test(char)) {
+        between += char;
+        i++;
+        continue;
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
+  private getWordBefore(line: string, endIndex: number): string {
+    const prefix = line.substring(0, endIndex);
+    const match = prefix.match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
+    return match ? match[1] : '';
+  }
+
+  private isLikelyOpeningQuote(line: string, charIndex: number, quote: string): boolean {
+    let escape = false;
+    let count = 0;
+    for (let i = 0; i < charIndex; i++) {
+      const char = line[i];
+      if (char === '\\' && !escape) {
+        escape = true;
+        continue;
+      }
+      if (char === quote && !escape) {
+        count++;
+      }
+      escape = false;
+    }
+    return count % 2 === 0;
   }
 }
