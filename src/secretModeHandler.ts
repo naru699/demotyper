@@ -229,6 +229,10 @@ export class SecretModeHandler implements vscode.Disposable {
       return;
     }
 
+    // 通知 smartReplaceHandler 删除操作，以更新占位符偏移量
+    const deleteOffset = doc.offsetAt(range.start);
+    this.smartReplaceHandler.notifyDeletion(deleteOffset, removedLength);
+
     editor.selection = new vscode.Selection(range.start, range.start);
   }
 

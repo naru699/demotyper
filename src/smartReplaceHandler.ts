@@ -9,7 +9,10 @@ export class SmartReplaceHandler {
   private insertHistory: Array<{ offset: number; text: string; deleteCount: number; timestamp: number }> = [];
   private lastInsertAttempt?: { offset: number; text: string; deleteCount: number };
   private repeatedInsertCount = 0;
+  private placeholderClosings: number[] = []; // sorted array of offsets for auto-paired closings (shift-aware)
   private readonly maxRepeatedInsertAttempts = 3;
+  private lastDocumentLength = 0; // 用于检测进度停滞
+  private stagnantInsertCount = 0; // 文档长度未变化的连续插入次数
 
   constructor(
     private readonly targetFileManager: TargetFileManager,
@@ -157,7 +160,42 @@ export class SmartReplaceHandler {
     this.insertHistory = [];
     this.lastInsertAttempt = undefined;
     this.repeatedInsertCount = 0;
-    this.logger.info('[RESET] Cleared insert history');
+    this.placeholderClosings = [];
+    this.lastDocumentLength = 0;
+    this.stagnantInsertCount = 0;
+    this.logger.info('[RESET] Cleared insert history and progress tracking');
+  }
+
+  /**
+   * 通知外部删除操作，用于清理被删除的占位符并调整偏移量
+   * @param deleteOffset 删除起始位置
+   * @param deleteLength 删除长度
+   */
+  notifyDeletion(deleteOffset: number, deleteLength: number): void {
+    if (this.placeholderClosings.length === 0 || deleteLength <= 0) {
+      return;
+    }
+
+    const deleteEnd = deleteOffset + deleteLength;
+    const newPlaceholders: number[] = [];
+
+    for (const pOffset of this.placeholderClosings) {
+      // 如果占位符在删除范围内，移除它
+      if (pOffset >= deleteOffset && pOffset < deleteEnd) {
+        this.logger.info(`[PLACEHOLDER] Cleanup (external delete): removed at offset ${pOffset}`);
+        continue;
+      }
+
+      // 如果占位符在删除点之后，调整偏移量
+      if (pOffset >= deleteEnd) {
+        newPlaceholders.push(pOffset - deleteLength);
+      } else {
+        newPlaceholders.push(pOffset);
+      }
+    }
+
+    this.placeholderClosings = newPlaceholders;
+    this.logger.info(`[PLACEHOLDER] After external delete: array: [${this.placeholderClosings.join(', ')}]`);
   }
 
   private async insertAt(
@@ -172,41 +210,47 @@ export class SmartReplaceHandler {
     let effectiveCursorBackOffset = cursorBackOffset;
     const position = editor.document.positionAt(offset);
 
+    // 检测是否需要自动配对，但延迟添加占位符到 Drift Correction 之后
+    let isNewPairInsertion = false;
+    let isSmartBlockExpansion = false; // 标记是否触发了智能代码块展开
     if (deleteCount === 0 && effectiveCursorBackOffset === undefined) {
       const pairInfo = this.getAutoPairInsertion(text);
       if (pairInfo) {
         insertText = pairInfo.text;
         effectiveCursorBackOffset = pairInfo.cursorBackOffset;
-        this.logger.info(`[CROSS-LINE DEBUG] After auto-pair, char='${text}', next='${insertText}', cursorBack=${effectiveCursorBackOffset}`);
+        isNewPairInsertion = insertText.length === 2 && insertText[0] !== insertText[1];
+        this.logger.info(`[CROSS-LINE DEBUG] After auto-pair, char='${text}', next='${insertText}', cursorBack=${effectiveCursorBackOffset}, willAddPlaceholder=${isNewPairInsertion}`);
+
+        // ===== 智能代码块展开检测 =====
+        // 仅对 `{` 触发，检查 target 中 `{` 后是否紧跟换行符
+        if (isNewPairInsertion && text === '{') {
+          const targetContent = await this.targetFileManager.readTargetContent(editor.document.uri);
+          if (targetContent !== undefined) {
+            const targetNormalized = this.normalizeLineEndings(targetContent);
+            // offset 是在 current 文档中的位置，由于 analyzeDocumentState 确保在 offset 之前两者匹配
+            // 所以在 target 中对应位置也是这个 offset
+            const expandedText = this.detectSmartBraceExpansion(editor, targetNormalized, offset);
+            if (expandedText !== undefined) {
+              insertText = expandedText;
+              // 光标回退 1 个字符，落在 `}` 之前（缩进行末尾）
+              effectiveCursorBackOffset = 1;
+              isSmartBlockExpansion = true;
+              this.logger.info(`[SMART BLOCK] Overriding insertText to expanded block`);
+            }
+          }
+        }
+        // ===== 智能代码块展开检测结束 =====
       }
-    }
-
-    const visibleInput = text.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-    const visibleInsert = insertText.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-    this.logger.info(
-      `[AUTO-PAIR DEBUG] input='${visibleInput}', insert='${visibleInsert}', cursorBack=${effectiveCursorBackOffset ?? 0}`,
-    );
-
-    if (insertText.includes('\n')) {
-      const segments = insertText
-        .split('\n')
-        .map((line, index) => `line${index}="${line.replace(/ /g, '_') || ''}"`);
-      const previousInsert = this.insertHistory[this.insertHistory.length - 1];
-      const previousVisible = previousInsert
-        ? previousInsert.text.replace(/\r/g, '\\r').replace(/\n/g, '\\n')
-        : 'n/a';
-      this.logger.info(
-        `[CROSS-LINE DEBUG] Multi-line insert after '${visibleInput}', segments (spaces as '_'): ${segments.join(
-          ' | ',
-        )}, prevInsert='${previousVisible}', offset=${offset}, deleteCount=${deleteCount}`,
-      );
     }
 
     const charDesc = this.getCharDescription(insertText);
     const now = Date.now();
 
-    // 检测死循环：同一offset+文本被连续插入
+    const isPlaceholderClosing = this.placeholderClosings.includes(offset) && this.isAutoPairClosingChar(insertText);
+
+    // 检测死循环：同一offset+文本被连续插入（占位闭符不计入）
     if (
+      !isPlaceholderClosing &&
       this.lastInsertAttempt &&
       this.lastInsertAttempt.offset === offset &&
       this.lastInsertAttempt.text === insertText &&
@@ -227,12 +271,15 @@ export class SmartReplaceHandler {
       this.lastInsertAttempt = { offset, text: insertText, deleteCount };
     }
 
-    // 检测死循环：同一offset被频繁插入
-    const recentSameOffset = this.insertHistory.filter(
-      (h) => h.offset === offset && h.text === insertText && h.deleteCount === deleteCount && now - h.timestamp < 5000
-    );
-
-    this.logger.info(`[INSERT] History check: offset=${offset} has been inserted ${recentSameOffset.length} times in last 5 seconds`);
+      // 检测死循环：同一offset被频繁插入（占位闭符不计入）
+      const recentSameOffset = this.insertHistory.filter(
+        (h) =>
+          h.offset === offset &&
+          h.text === insertText &&
+          h.deleteCount === deleteCount &&
+          now - h.timestamp < 5000 &&
+          !(isPlaceholderClosing && this.isAutoPairClosingChar(h.text)),
+      );
 
     if (recentSameOffset.length >= 3) {
       // 触发保护机制
@@ -249,17 +296,8 @@ export class SmartReplaceHandler {
       return false;
     }
 
-    const deleteCountInfo = deleteCount > 0 ? `, deleteCount=${deleteCount}` : '';
-
-    this.logger.info(
-      `[INSERT] At offset ${offset} (line ${position.line}, char ${position.character}), inserting: ${charDesc}, length: ${insertText.length}${deleteCountInfo}`,
-    );
-    this.logger.info(`[INSERT] Document EOL: ${editor.document.eol === vscode.EndOfLine.CRLF ? 'CRLF' : 'LF'}`);
-
-    // 记录插入前文档内容的片段
+    // 记录插入前文档内容
     const beforeText = editor.document.getText();
-    const beforePreview = this.getContentPreview(beforeText.substring(Math.max(0, offset - 10), offset + 20), 50);
-    this.logger.info(`[INSERT] Before insert, around offset: "${beforePreview}"`);
 
     const deleteEndPosition = deleteCount > 0 ? editor.document.positionAt(offset + deleteCount) : position;
     const applied = await editor.edit(
@@ -274,48 +312,90 @@ export class SmartReplaceHandler {
     );
 
     if (!applied) {
-      this.logger.info(`[INSERT] Failed to apply edit`);
       return false;
     }
 
-    // 记录插入后文档内容的片段
     const afterText = editor.document.getText();
-    const afterPreview = this.getContentPreview(afterText.substring(Math.max(0, offset - 10), offset + 30), 60);
-    this.logger.info(`[INSERT] After insert, around offset: "${afterPreview}"`);
 
     const actualInsertedLength = this.calculateInsertedLength(insertText, editor.document.eol);
     const defaultNewOffset = offset + actualInsertedLength;
     const normalizedBackOffset = effectiveCursorBackOffset ? Math.min(effectiveCursorBackOffset, actualInsertedLength) : 0;
     const finalCursorOffset = Math.max(offset, defaultNewOffset - normalizedBackOffset);
 
-    if (insertText.includes('\n')) {
-      const insertPosition = editor.document.positionAt(offset);
-      const lines = insertText.split('\n');
-      const newlineCount = lines.length - 1;
-      const lastLineContent = lines[lines.length - 1];
-      this.logger.info(
-        `[INSERT] Inserted text with ${newlineCount} newline(s), cursor default at line ${insertPosition.line + newlineCount}, char ${lastLineContent.length}`,
-      );
-    } else {
-      this.logger.info(`[INSERT] Text length: ${text.length}, actual inserted: ${actualInsertedLength}, new offset: ${defaultNewOffset}`);
-    }
-
-    if (normalizedBackOffset > 0) {
-      this.logger.info(`[INSERT] Moving cursor back by ${normalizedBackOffset} character(s) to align with smart snippet target`);
-    }
-
     const nextPosition = editor.document.positionAt(finalCursorOffset);
     editor.selection = new vscode.Selection(nextPosition, nextPosition);
 
-    this.logger.info(`[INSERT] Success, cursor at line ${nextPosition.line}, char ${nextPosition.character}`);
-    this.logger.info(`[INSERT] Document length changed from ${beforeText.length} to ${afterText.length}`);
+    // 进度停滞检测：如果文档长度没有增长，计数器+1
+    if (afterText.length <= this.lastDocumentLength && this.lastDocumentLength > 0) {
+      this.stagnantInsertCount++;
+      if (this.stagnantInsertCount >= 5) {
+        const errorMsg = `检测到进度停滞：连续 ${this.stagnantInsertCount} 次插入后文档长度未增长。可能存在逻辑错误。`;
+        this.logger.info(`[PROGRESS STALL DETECTED] ${errorMsg}`);
+        await this.notifications.warning(`DemoTyper: ${errorMsg}\n\n请检查目标文件格式是否正确，或尝试使用 Restore Current File 命令重置文档状态。`);
+        this.stagnantInsertCount = 0;
+        return false;
+      }
+    } else {
+      this.stagnantInsertCount = 0;
+    }
+    this.lastDocumentLength = afterText.length;
 
     // 插入成功后记录到历史
     this.insertHistory.push({ offset, text: insertText, deleteCount, timestamp: now });
     if (this.insertHistory.length > 10) {
       this.insertHistory.shift();
     }
-    this.logger.info(`[INSERT] Recorded to history. History size: ${this.insertHistory.length}`);
+
+    // Drift Correction & Cleanup: 更新或移除占位符偏移量
+    // netChange = 插入长度 - 删除长度
+    const netChange = actualInsertedLength - deleteCount;
+    if (this.placeholderClosings.length > 0) {
+      const deleteEnd = offset + deleteCount;
+      const newPlaceholders: number[] = [];
+
+      for (let i = 0; i < this.placeholderClosings.length; i++) {
+        const pOffset = this.placeholderClosings[i];
+
+        // Cleanup: 如果占位符在删除范围内，移除它
+        if (deleteCount > 0 && pOffset >= offset && pOffset < deleteEnd) {
+          this.logger.info(`[PLACEHOLDER] Cleanup: removed placeholder at offset ${pOffset} (was in delete range ${offset}-${deleteEnd})`);
+          continue;
+        }
+
+        // Drift Correction: 如果占位符在修改点之后，调整偏移量
+        if (pOffset > offset) {
+          const newOffset = pOffset + netChange;
+          if (newOffset >= 0) {
+            newPlaceholders.push(newOffset);
+          }
+        } else {
+          newPlaceholders.push(pOffset);
+        }
+      }
+
+      this.placeholderClosings = newPlaceholders;
+      if (netChange !== 0 || newPlaceholders.length !== this.placeholderClosings.length) {
+        this.logger.info(`[PLACEHOLDER] After drift/cleanup: netChange=${netChange}, array: [${this.placeholderClosings.join(', ')}]`);
+      }
+    }
+
+    // 添加新的占位符（在 Drift Correction 之后，避免被错误偏移）
+    if (isNewPairInsertion) {
+      // 计算闭合符 `}` / `)` / `]` 的偏移量
+      // - 普通配对 (如 '{}')：闭符在 offset + 1
+      // - 智能展开 (如 '{\n    }')：闭符在 offset + actualInsertedLength - 1
+      const closingOffset = isSmartBlockExpansion
+        ? offset + actualInsertedLength - 1
+        : offset + 1;
+      // 保持数组有序插入
+      const insertIdx = this.placeholderClosings.findIndex(o => o > closingOffset);
+      if (insertIdx === -1) {
+        this.placeholderClosings.push(closingOffset);
+      } else {
+        this.placeholderClosings.splice(insertIdx, 0, closingOffset);
+      }
+      this.logger.info(`[PLACEHOLDER] Added new closing at offset ${closingOffset}${isSmartBlockExpansion ? ' (smart block)' : ''}, array: [${this.placeholderClosings.join(', ')}]`);
+    }
 
     return true;
   }
@@ -533,11 +613,11 @@ export class SmartReplaceHandler {
         return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
       }
 
-      const currentLine = currentLines[currentLineIndex];
+    const currentLine = currentLines[currentLineIndex];
 
-      // 比对当前行
-      if (currentLine === targetLine) {
-        // 这一行内容匹配，但需要检查是否需要在行末插入换行符
+    // 比对当前行
+    if (currentLine === targetLine) {
+      // 这一行内容匹配，但需要检查是否需要在行末插入换行符
         // 计算这一行在文档中的起始偏移量
         const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
         const lineEndOffset = lineStartOffset + currentLine.length;
@@ -622,36 +702,141 @@ export class SmartReplaceHandler {
         continue;
       }
 
-      // 行不匹配 - 找出差异
-      this.logger.info(`[DEBUG] Line ${targetLineIndex} mismatch:`);
-      this.logger.info(`[DEBUG]   Current[${currentLineIndex}]: "${currentLine}"`);
-      this.logger.info(`[DEBUG]   Target[${targetLineIndex}]: "${targetLine}"`);
+    // 行不匹配 - 找出差异
+    this.logger.info(`[DEBUG] Line ${targetLineIndex} mismatch:`);
+    this.logger.info(`[DEBUG]   Current[${currentLineIndex}]: "${currentLine}"`);
+    this.logger.info(`[DEBUG]   Target[${targetLineIndex}]: "${targetLine}"`);
 
-      // 如果目标行非空且当前行要插入的首个字符应该是换行（缺失整行/块），优先先插入换行+缩进，再逐字符补齐
-      if (targetLineIndex > currentLineIndex && this.isLineMissingAhead(currentLines, targetLines, currentLineIndex, targetLineIndex)) {
-        const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
-        const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
-        const leadingSpaces = this.getLeadingSpaces(targetLine);
-        this.logger.info(`[DEBUG] Detected missing line/block before current content; insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
-        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+    // 特殊处理：当前行是目标行的前缀但包含额外语句（如多语句合并在一行）
+    if (currentLine.startsWith(targetLine) && currentLine.length > targetLine.length) {
+      const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+      const lineEndOffset = lineStartOffset + targetLine.length;
+      const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
+      const nextTargetLine = targetLines[targetLineIndex + 1] ?? '';
+      const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+
+      this.logger.info('[DEBUG] Current line is a prefix of target line but has extra content; inserting newline to split it');
+      // 仍然只插入换行+缩进（符号以外不批量写入）
+      return {
+        state: 'gap',
+        insertOffset: originalOffset,
+        nextChar: '\n' + leadingSpaces,
+      };
+    }
+
+    // 特殊处理：当前行末尾有占位符闭合符号（如自动配对的 } ) ]），需要在闭合符之前继续填充
+    // 场景：当前 "if (!this.messageCallback)}" 目标 "if (!this.messageCallbacks.has(type)) {"
+    // 需要找到第一个不匹配的位置，在那里插入缺失的字符
+    const currentTrimmedEnd = currentLine.trimEnd();
+    if (currentTrimmedEnd.length > 0) {
+      // 从末尾向前查找连续的闭合符号
+      let trailingClosingCount = 0;
+      for (let i = currentTrimmedEnd.length - 1; i >= 0; i--) {
+        if (this.isAutoPairClosingChar(currentTrimmedEnd[i])) {
+          trailingClosingCount++;
+        } else {
+          break;
+        }
       }
 
-      // 特殊处理：当前行是目标行的前缀但包含额外语句（如多语句合并在一行）
-      if (currentLine.startsWith(targetLine) && currentLine.length > targetLine.length) {
-        const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
-        const lineEndOffset = lineStartOffset + targetLine.length;
-        const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
-        const nextTargetLine = targetLines[targetLineIndex + 1] ?? '';
-        const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+      if (trailingClosingCount > 0) {
+        // 去掉末尾所有闭合符后的内容
+        const currentWithoutClosings = currentTrimmedEnd.substring(0, currentTrimmedEnd.length - trailingClosingCount);
+        const targetTrimmed = targetLine.trimEnd();
 
-        this.logger.info('[DEBUG] Current line is a prefix of target line but has extra content; inserting newline to split it');
-        // 仍然只插入换行+缩进（符号以外不批量写入）
-        return {
-          state: 'gap',
-          insertOffset: originalOffset,
-          nextChar: '\n' + leadingSpaces,
-        };
+        this.logger.info(`[DEBUG] Found ${trailingClosingCount} trailing closing char(s), currentWithoutClosings="${currentWithoutClosings}"`);
+
+        // ===== High-Priority Guard: Split & Retreat for Empty Lines =====
+        // 如果当前行（去掉闭合符后）只有空白字符，且目标行有实际内容
+        // 必须先拆行，将占位符推到下一行，而不是直接插入字符
+        if (currentWithoutClosings.trim().length === 0 && targetTrimmed.length > 0) {
+          // 检查目标行是否也是纯闭合符号行
+          const targetIsClosingOnly = targetTrimmed.split('').every(c => this.isAutoPairClosingChar(c));
+
+          if (!targetIsClosingOnly) {
+            // 目标有实际内容，必须拆行
+            const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+            const currentIndent = this.getLeadingSpaces(currentLine);
+            const insertPos = lineStartOffset + currentIndent.length;
+            const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
+
+            // 构建插入文本：换行 + 缩进
+            const insertText = '\n' + currentIndent;
+
+            this.logger.info(`[GAP-FIX] High-Priority: Trailing closing on whitespace-only line. Splitting & Retreating.`);
+            this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
+            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursorBackOffset=${insertText.length}`);
+
+            return {
+              state: 'gap',
+              insertOffset: originalOffset,
+              nextChar: insertText,
+              cursorBackOffset: insertText.length,
+            };
+          }
+        }
+        // ===== High-Priority Guard End =====
+
+        // 场景 A: 当前行（去掉闭合符）是目标行的前缀，说明闭合符是占位符
+        if (currentWithoutClosings.length > 0 &&
+            targetTrimmed.startsWith(currentWithoutClosings) &&
+            currentWithoutClosings.length < targetTrimmed.length) {
+          const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+          const insertPos = lineStartOffset + currentWithoutClosings.length;
+          const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
+
+          // 找出下一个要插入的字符
+          const nextCharIdx = currentWithoutClosings.length;
+          const nextChar = targetTrimmed[nextCharIdx];
+
+          // 严格检查：只有当目标字符不是闭合符时才插入
+          // 如果目标字符也是闭合符，说明占位符位置正确，不需要插入
+          if (!this.isAutoPairClosingChar(nextChar)) {
+            this.logger.info(`[DEBUG] Placeholder detected: inserting '${nextChar}' before trailing closings at offset ${originalOffset}`);
+            return { state: 'gap', insertOffset: originalOffset, nextChar };
+          }
+        }
+
+        // 场景 B: 当前行只有缩进+占位符闭合符（如 "    }"），而目标行有实际内容（如 "    stmt;"）
+        // 这种情况下，占位符 } 应该属于后续行，需要在它之前插入换行符将占位符推下去
+        if (currentWithoutClosings.length === 0 && targetTrimmed.length > 0) {
+          // 整行只有缩进和闭合符号
+          const currentIndent = this.getLeadingSpaces(currentLine);
+
+          // 检查目标行是否也是闭合符号行（如 "    }" vs "    }"）
+          // 如果是，说明匹配的是同一个闭合符，不需要额外插入
+          if (targetTrimmed.split('').every(c => this.isAutoPairClosingChar(c))) {
+            // 目标行也只有闭合符号，检查是否匹配
+            this.logger.info(`[DEBUG] Both current and target are closing-only lines`);
+            // 继续下面的逐字符比对
+          } else {
+            // ===== Split & Retreat Fix =====
+            // 目标行有实际内容，而当前行只有占位符
+            // 正确做法：先插入换行符，将占位符推到下一行，然后光标回退
+            // 这样下一次击键时，代码会写在空行上，占位符在下面
+            const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+            // 插入位置在缩进之后，占位符之前
+            const insertPos = lineStartOffset + currentIndent.length;
+            const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
+
+            // 构建插入文本：换行 + 当前行缩进（占位符保持原缩进）
+            const insertText = '\n' + currentIndent;
+
+            this.logger.info(`[GAP-FIX] Trailing closing detected on placeholder-only line. Splitting & Retreating.`);
+            this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
+            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}) at offset ${originalOffset}, cursorBackOffset=${insertText.length}`);
+
+            return {
+              state: 'gap',
+              insertOffset: originalOffset,
+              nextChar: insertText,
+              cursorBackOffset: insertText.length,
+            };
+            // ===== Split & Retreat Fix End =====
+          }
+        }
       }
+    }
 
       if (this.isPlaceholderDeletionLine(currentLine)) {
         const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
@@ -713,7 +898,7 @@ export class SmartReplaceHandler {
       // 情况1: 当前是空行，目标不是空行
       if (isCurrentEmpty && !isTargetEmpty) {
         // 检查当前行是否只有缩进（支持空格和制表符混合）
-        const currentIndent = currentLine.match(/^[ \t]*/)?.[0] || '';
+        const currentIndent = this.getLeadingSpaces(currentLine);
         const targetIndent = this.getLeadingSpaces(targetLine);
 
         // 如果当前行只有缩进字符，且少于目标行的缩进，一次性插入缺失的缩进
@@ -742,7 +927,7 @@ export class SmartReplaceHandler {
         // 对于 "()"/"{}" 之类的临时占位行，先继续补充内容，避免频繁插入换行导致死循环
         const looksLikePairSkeleton = currentTrimmedLen > 0 &&
           currentTrimmedLen <= 4 &&
-          /^[\(\[\{][\)\]\}]?$/.test(currentTrimmed);
+          this.isPairSkeletonString(currentTrimmed);
         const stillFilling = targetTrimmedLen > 0 &&
           (currentTrimmedLen < targetTrimmedLen * 0.6 || looksLikePairSkeleton);
 
@@ -835,56 +1020,144 @@ export class SmartReplaceHandler {
       // 计算这一行在文档中的起始偏移量
       const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
 
-      // 逐字符比对找出差异
+      // 逐字符比对找出差异 (Strict Matching)
       const maxLen = Math.max(currentLine.length, targetLine.length);
       for (let charIdx = 0; charIdx < maxLen; charIdx++) {
         const currentChar = currentLine[charIdx];
         const targetChar = targetLine[charIdx];
+        const charOffset = lineStartOffset + charIdx;
+        const originalOffset = this.mapNormalizedToOriginal(charOffset, currentMapping);
 
+        // CASE 1: 字符匹配
+        if (currentChar === targetChar && currentChar !== undefined) {
+          // Strict Consumption: 如果匹配的字符是占位符，消费它
+          const placeholderIdx = this.placeholderClosings.indexOf(originalOffset);
+          if (placeholderIdx !== -1 && this.isAutoPairClosingChar(currentChar)) {
+            this.placeholderClosings.splice(placeholderIdx, 1);
+            this.logger.info(`[PLACEHOLDER] Consumed closing '${currentChar}' at offset ${originalOffset}, remaining: [${this.placeholderClosings.join(', ')}]`);
+          }
+          // 继续下一个字符
+          continue;
+        }
+
+        // CASE 2: 字符不匹配 - 必须立即返回 GAP，绝不跳过！
         if (currentChar !== targetChar) {
-          const charOffset = lineStartOffset + charIdx;
-          const originalOffset = this.mapNormalizedToOriginal(charOffset, currentMapping);
+          // [GAP-XRAY] 字符级不匹配诊断
+          const xrayCurrentDesc = currentChar === undefined ? '<EOL>' : `'${currentChar}'`;
+          const xrayTargetDesc = targetChar === undefined ? '<EOL>' : `'${targetChar}'`;
+          const xrayPlaceholderHere = this.placeholderClosings.includes(originalOffset);
+          this.logger.info(`[GAP-XRAY] MISMATCH @ line ${currentLineIndex}, char ${charIdx}: current=${xrayCurrentDesc}, target=${xrayTargetDesc}, isPlaceholderHere=${xrayPlaceholderHere}`);
+          this.logger.info(`[GAP-XRAY] Line context: current="${currentLine.substring(0, 60)}${currentLine.length > 60 ? '...' : ''}" | target="${targetLine.substring(0, 60)}${targetLine.length > 60 ? '...' : ''}"`);
 
+          // CASE 2a: 目标行已结束，当前行还有内容
           if (targetChar === undefined && currentChar !== undefined) {
-            // 当前行比目标行长，优先尝试将多余内容拆到下一行
-            if (targetLineIndex + 1 < targetLines.length) {
-              const nextTargetLine = targetLines[targetLineIndex + 1];
-              const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
-              this.logger.info(`[DEBUG] Current line has extra content at pos ${charIdx}; inserting newline to split statements`);
-              return {
-                state: 'gap',
-                insertOffset: originalOffset,
-                nextChar: '\n' + leadingSpaces,
-              };
+            // 检查剩余内容是否全是占位符闭合符号
+            const remainingContent = currentLine.substring(charIdx);
+            const isAllClosingChars = remainingContent.length > 0 &&
+              remainingContent.split('').every(c => this.isAutoPairClosingChar(c));
+
+            if (isAllClosingChars) {
+              // 剩余内容全是占位符，这行的目标内容已完成
+              // 需要在占位符之前插入换行，将占位符推到下一行
+              //
+              // 关键：占位符的缩进应该使用当前行的缩进（因为占位符是从当前行分离出去的）
+              // 而不是 target 下一行的缩进（那可能是块内容，缩进更深）
+              if (targetLineIndex + 1 < targetLines.length) {
+                // 使用当前行的缩进作为占位符的缩进
+                const currentIndent = this.getLeadingSpaces(currentLine);
+                // [GAP-XRAY] CASE 2a: Placeholder separation
+                this.logger.info(`[GAP-XRAY] CASE 2a: Target line done, remaining "${remainingContent}" are placeholders`);
+                this.logger.info(`[GAP-XRAY] CASE 2a: Inserting newline + indent(${currentIndent.length}) before placeholders at offset ${originalOffset}`);
+                return {
+                  state: 'gap',
+                  insertOffset: originalOffset,
+                  nextChar: '\n' + currentIndent,
+                };
+              }
+              // 没有下一行，跳出循环检查是否同步
+              this.logger.info(`[DEBUG] Target line done, remaining "${remainingContent}" are placeholders, no more target lines`);
+              break;
             }
-            if (this.isAutoPairClosingChar(currentChar)) {
-              this.logger.info(
-                `[DEBUG] Skipping auto-paired closing char '${currentChar}' at line ${targetLineIndex}, pos ${charIdx} to allow target to catch up`,
-              );
-              continue;
-            }
-            this.logger.info(`[DEBUG] Current line is longer than target line at pos ${charIdx} (mismatch)`);
-            this.logger.info(`[DEBUG] Current has extra content: "${currentLine.substring(charIdx)}"`);
+
+            // 有非占位符内容 - 这通常表示 mismatch
+            // 但为了容错，我们可以尝试在额外内容前插入换行，使用当前行的缩进
+            this.logger.info(`[DEBUG] Current line has extra non-placeholder content "${remainingContent}" at pos ${charIdx}`);
+            this.logger.info(`[DEBUG] This is likely a mismatch, returning mismatch state`);
             return { state: 'mismatch', offset: originalOffset };
           }
 
-          let nextChar = targetChar || '';
+          // CASE 2b: 目标还有字符，当前没有或不匹配
 
+          // ===== Split Line Guard (防止 Sticky Bracket) =====
+          // 场景：当前行只有缩进+占位符（如 "    }"），目标行有实际内容（如 "    if (..."）
+          // 如果直接插入 targetChar，会导致 "    i}" -> "    if}" 的粘连问题
+          // 正确做法：先插入换行符，把占位符推到下一行，然后再插入内容
+          if (currentChar !== undefined &&
+              this.isAutoPairClosingChar(currentChar) &&
+              targetChar !== undefined &&
+              targetChar !== '\n') {
+            // 检查当前行在 charIdx 之前是否全是空白字符
+            const beforeCursor = currentLine.substring(0, charIdx);
+            const isBeforeCursorWhitespaceOnly = this.isWhitespaceOnly(beforeCursor);
+
+            if (isBeforeCursorWhitespaceOnly) {
+              // 触发拆行：在占位符前插入换行，将占位符推到下一行
+              const currentIndent = this.getLeadingSpaces(currentLine);
+              const insertText = '\n' + currentIndent;
+
+              this.logger.info(`[GAP-FIX] Splitting placeholder-only line to prevent sticky brackets`);
+              this.logger.info(`[GAP-FIX] Before: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
+              this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}) at offset ${originalOffset}, cursorBackOffset=${insertText.length}`);
+
+              // 关键：设置 cursorBackOffset = insertText.length
+              // 这样光标会回退到插入点之前，即停留在上一行末尾
+              // 而不是跟着跳到下一行紧贴 `}`
+              return {
+                state: 'gap',
+                insertOffset: originalOffset,
+                nextChar: insertText,
+                cursorBackOffset: insertText.length,
+              };
+            }
+          }
+          // ===== Split Line Guard End =====
+
+          // 标准处理：插入 targetChar，把占位符"推向右边"
+          const nextChar = targetChar || '';
           const charDesc = this.getCharDescription(nextChar);
 
-          this.logger.info(`[DEBUG] Char diff at line ${targetLineIndex}, pos ${charIdx}: insert ${charDesc}`);
-          this.logger.info(`[DEBUG] Insert at offset ${originalOffset}`);
+          // [GAP-XRAY] Scenario B - Push Logic
+          this.logger.info(`[GAP-XRAY] SCENARIO B (Push): Inserting '${charDesc}' at offset ${originalOffset}`);
+          this.logger.info(`[GAP-XRAY] Push will shift placeholders right. Current placeholders: [${this.placeholderClosings.join(', ')}]`);
 
           return { state: 'gap', insertOffset: originalOffset, nextChar };
         }
       }
+
+      // [GAP-XRAY] 决策区：字符循环结束，所有字符都匹配
+      this.logger.info(`[GAP-XRAY] DECISION ZONE: Loop ended for line ${currentLineIndex}. currentLine.len=${currentLine.length}, targetLine.len=${targetLine.length}`);
+      this.logger.info(`[GAP-XRAY] Placeholders: [${this.placeholderClosings.join(', ')}]`);
 
       // 如果到这里，说明逐字符比对后所有字符都匹配了
       // 但需要检查是否需要在行末插入换行符
       if (targetLineIndex < targetLines.length - 1) {
         // 目标文件中该行后面还有更多行，需要插入换行符
         const lineEndOffset = lineStartOffset + targetLine.length;
-        const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
+        let insertOffset = lineEndOffset;
+
+        // 检查当前行在目标行长度之后是否还有占位符闭合符号
+        // 如果有，应该在闭合符之前插入换行，而不是在行末
+        if (currentLine.length > targetLine.length) {
+          const extraContent = currentLine.substring(targetLine.length);
+          const extraTrimmed = extraContent.trim();
+          // 如果多余内容只是闭合符号，在它之前插入换行
+          if (extraTrimmed.length > 0 && this.isAutoPairClosingChar(extraTrimmed[0])) {
+            this.logger.info(`[DEBUG] Found placeholder closing '${extraTrimmed[0]}' after target content; inserting newline before it`);
+            // insertOffset 保持在 targetLine.length 的位置，即闭合符之前
+          }
+        }
+
+        const originalOffset = this.mapNormalizedToOriginal(insertOffset, currentMapping);
 
         // 获取下一行的缩进
         const nextTargetLine = targetLines[targetLineIndex + 1];
@@ -922,7 +1195,7 @@ export class SmartReplaceHandler {
       } else {
         // 多余的行不是单个空字符串，检查是否有实质内容
         const remainingText = remainingLines.join('\n');
-        if (!/^\s*$/.test(remainingText)) {
+        if (!this.isWhitespaceOnly(remainingText)) {
           const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
           const originalOffset = this.mapNormalizedToOriginal(lineStartOffset, currentMapping);
           this.logger.info(`[DEBUG] Current has extra non-whitespace lines`);
@@ -943,7 +1216,17 @@ export class SmartReplaceHandler {
   private isStructuralLine(line: string): boolean {
     const trimmed = line.trim();
     // 空行或只有结构符号（}, {, ); 等）
-    return trimmed === '' || /^[\}\{;,\)\]]+$/.test(trimmed);
+    if (trimmed === '') {
+      return true;
+    }
+    // 检查是否只包含结构符号
+    for (let i = 0; i < trimmed.length; i++) {
+      const c = trimmed[i];
+      if (c !== '}' && c !== '{' && c !== ';' && c !== ',' && c !== ')' && c !== ']') {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -1059,7 +1342,7 @@ export class SmartReplaceHandler {
     const clamped = Math.min(cursorBackOffset, originalText.length);
     const desiredIndex = Math.max(0, originalText.length - clamped);
     const beforeCursor = originalText.substring(0, desiredIndex);
-    const newlineBeforeCursor = (beforeCursor.match(/\n/g)?.length ?? 0);
+    const newlineBeforeCursor = this.countNewlines(beforeCursor);
     const adjustedIndex = desiredIndex + newlineBeforeCursor;
     const adjustedCursorBack = Math.max(0, convertedText.length - adjustedIndex);
     return adjustedCursorBack;
@@ -1074,10 +1357,19 @@ export class SmartReplaceHandler {
 
   /**
    * 提取字符串开头的空白字符（空格和制表符）
+   * 不使用正则表达式，确保性能和安全性
    */
   private getLeadingSpaces(line: string): string {
-    const match = line.match(/^[ \t]*/);
-    return match ? match[0] : '';
+    let i = 0;
+    while (i < line.length) {
+      const char = line[i];
+      if (char === ' ' || char === '\t') {
+        i++;
+      } else {
+        break;
+      }
+    }
+    return line.substring(0, i);
   }
 
   /**
@@ -1101,14 +1393,14 @@ export class SmartReplaceHandler {
     }
 
     // 去除常见的单行注释后缀 (//... 或 #... 或 /*...*/)
-    const withoutComment1 = trimmed1.replace(/\s*(\/\/|#|\/\*).*$/, '').trimEnd();
-    const withoutComment2 = trimmed2.replace(/\s*(\/\/|#|\/\*).*$/, '').trimEnd();
+    const withoutComment1 = this.stripTrailingComment(trimmed1);
+    const withoutComment2 = this.stripTrailingComment(trimmed2);
 
     return withoutComment1 === withoutComment2;
   }
 
   private isPlaceholderDeletionLine(line: string): boolean {
-    return /\[DELETED\]/.test(line);
+    return line.includes('[DELETED]');
   }
 
   /**
@@ -1226,33 +1518,35 @@ export class SmartReplaceHandler {
 
   /**
    * 检查一组行是否包含代码块模式
-   * 识别常见的代码块结构：
-   * - 大括号块：{ ... }
-   * - Python冒号块：if/for/while/def/class ... :
-   * - HTML标签块：<tag> ... </tag>
+   * 识别常见的代码块结构（不使用正则表达式）
    */
   private hasCodeBlockPattern(lines: string[]): boolean {
     if (lines.length === 0) {
       return false;
     }
 
-    const allText = lines.join(' ').trim();
+    const firstLine = lines[0];
+    const firstLineTrimmed = firstLine.trimEnd();
 
-    // 模式1: C-like大括号块 (if{}, for{}, while{}, function{} 等)
-    const hasBraceBlock = /\b(if|for|while|function|class|def|struct)\s*\([^)]*\)\s*\{|\{\s*$/.test(lines[0]);
+    // 模式1: 行以 { 结尾（C-like 代码块开始）
+    const hasBraceBlock = firstLineTrimmed.endsWith('{');
 
-    // 模式2: Python冒号块
-    const hasColonBlock = /\b(if|for|while|def|class|with|try|except|finally|elif|else)\b.*:\s*$/.test(lines[0]);
+    // 模式2: 行以 : 结尾（Python 代码块开始）
+    const hasColonBlock = firstLineTrimmed.endsWith(':');
 
-    // 模式3: HTML/XML标签块
-    const hasTagBlock = /<\w+[^>]*>.*<\/\w+>/.test(allText) || /<\w+[^>]*>\s*$/.test(lines[0]);
+    // 模式3: 行以 > 结尾且包含 <（可能是 HTML 标签）
+    const hasTagBlock = firstLineTrimmed.endsWith('>') && firstLineTrimmed.includes('<');
 
     // 模式4: 检查是否有明显的缩进增加（块的特征）
     const firstIndent = this.getLeadingSpaces(lines[0]).length;
-    const hasIndentIncrease = lines.slice(1).some(line => {
-      const lineIndent = this.getLeadingSpaces(line).length;
-      return lineIndent > firstIndent;
-    });
+    let hasIndentIncrease = false;
+    for (let i = 1; i < lines.length; i++) {
+      const lineIndent = this.getLeadingSpaces(lines[i]).length;
+      if (lineIndent > firstIndent) {
+        hasIndentIncrease = true;
+        break;
+      }
+    }
 
     return hasBraceBlock || hasColonBlock || hasTagBlock || hasIndentIncrease;
   }
@@ -1285,43 +1579,6 @@ export class SmartReplaceHandler {
     return lcs / longerLen;
   }
 
-  /**
-   * 检测是否存在“目标行在当前行之前缺失”的情况，
-   * 用于优先插入换行+缩进，再逐字符补齐内容（避免直接批量插入行内容）。
-   */
-  private isLineMissingAhead(
-    currentLines: string[],
-    targetLines: string[],
-    currentLineIndex: number,
-    targetLineIndex: number,
-  ): boolean {
-    if (targetLineIndex <= currentLineIndex) {
-      return false;
-    }
-    const targetLine = targetLines[targetLineIndex];
-    if (targetLine.trim().length === 0) {
-      return false; // 目标行为空行则不认为缺行
-    }
-
-    const currentLine = currentLines[currentLineIndex] || '';
-
-    // 如果当前行是紧随目标行之后的内容（例如缺了一整行/块），通常当前行的前缀会与目标后续行对不上
-    // 我们检查当前行是否与目标后续某行相似，如果是，则说明中间缺行
-    const maxLookAhead = 5;
-    for (let i = targetLineIndex + 1; i < Math.min(targetLineIndex + 1 + maxLookAhead, targetLines.length); i++) {
-      const candidate = targetLines[i];
-      if (candidate.trim().length === 0) {
-        continue;
-      }
-      const similarity = this.calculateLineSimilarity(currentLine, candidate);
-      if (similarity >= 0.5) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
   private getAutoPairInsertion(input: string): { text: string; cursorBackOffset: number } | undefined {
     if (input.length !== 1) {
       return undefined;
@@ -1338,6 +1595,80 @@ export class SmartReplaceHandler {
       default:
         return undefined;
     }
+  }
+
+  /**
+   * 从 target 内容中获取指定换行符位置之后下一行的前导缩进
+   * @param targetContent target 文件的完整内容（已规范化为 LF）
+   * @param newlineOffset 换行符 \n 的偏移量
+   * @returns 下一行的前导空格字符串，如果没有下一行则返回空字符串
+   */
+  private getNextLineIndentFromOffset(targetContent: string, newlineOffset: number): string {
+    // newlineOffset 指向 \n，下一行从 newlineOffset + 1 开始
+    const nextLineStart = newlineOffset + 1;
+
+    // 边界检查：如果没有下一行内容
+    if (nextLineStart >= targetContent.length) {
+      return '';
+    }
+
+    // 收集下一行的前导空格和制表符（不使用正则）
+    let indent = '';
+    for (let i = nextLineStart; i < targetContent.length; i++) {
+      const char = targetContent[i];
+      if (char === ' ' || char === '\t') {
+        indent += char;
+      } else {
+        // 遇到非空白字符，停止
+        break;
+      }
+    }
+
+    return indent;
+  }
+
+  /**
+   * 检测是否需要智能展开 `{` 为代码块
+   * 条件：target 文件中 `{` 紧跟换行符
+   * @param editor 当前编辑器
+   * @param targetContent target 文件的规范化内容
+   * @param offset 当前插入位置（在规范化 target 中）
+   * @returns 展开后的文本或 undefined（不展开）
+   */
+  private detectSmartBraceExpansion(
+    editor: vscode.TextEditor,
+    targetContent: string,
+    offset: number
+  ): string | undefined {
+    // 边界检查：确保 offset 和 offset+1 在范围内
+    if (offset < 0 || offset >= targetContent.length) {
+      return undefined;
+    }
+
+    // 检查 target 在此位置是否是 `{`
+    if (targetContent[offset] !== '{') {
+      return undefined;
+    }
+
+    // 检查 `{` 后面是否紧跟换行符
+    if (offset + 1 >= targetContent.length || targetContent[offset + 1] !== '\n') {
+      return undefined;
+    }
+
+    // 触发智能展开：获取下一行的缩进
+    const nextLineIndent = this.getNextLineIndentFromOffset(targetContent, offset + 1);
+
+    this.logger.info(`[SMART BLOCK] Detected '{' followed by newline in target at offset ${offset}`);
+    this.logger.info(`[SMART BLOCK] Next line indent: ${nextLineIndent.length} chars`);
+
+    // 构建展开文本: {\n + 缩进 + }
+    // 使用 \n 构建，然后通过 convertToDocumentEOL 转换为文档的 EOL 格式
+    const rawExpansion = '{\n' + nextLineIndent + '}';
+    const expandedText = this.convertToDocumentEOL(editor, rawExpansion);
+
+    this.logger.info(`[SMART BLOCK] Expanded to: "${this.getContentPreview(expandedText, 50)}"`);
+
+    return expandedText;
   }
 
   private findBraceAfterParenthesis(
@@ -1364,7 +1695,7 @@ export class SmartReplaceHandler {
         i++;
         continue;
       }
-      if (/[A-Za-z0-9_<>\[\]\?\!\:\.\,\|&]/.test(char)) {
+      if (this.isAllowedBetweenChar(char)) {
         between += char;
         i++;
         continue;
@@ -1376,8 +1707,29 @@ export class SmartReplaceHandler {
 
   private getWordBefore(line: string, endIndex: number): string {
     const prefix = line.substring(0, endIndex);
-    const match = prefix.match(/([A-Za-z_][A-Za-z0-9_]*)\s*$/);
-    return match ? match[1] : '';
+    // 从末尾向前跳过空白
+    let i = prefix.length - 1;
+    while (i >= 0 && (prefix[i] === ' ' || prefix[i] === '\t')) {
+      i--;
+    }
+    if (i < 0) {
+      return '';
+    }
+    // 从当前位置向前收集标识符字符
+    let wordEnd = i + 1;
+    while (i >= 0 && this.isIdentifierChar(prefix[i])) {
+      i--;
+    }
+    const wordStart = i + 1;
+    if (wordStart >= wordEnd) {
+      return '';
+    }
+    const word = prefix.substring(wordStart, wordEnd);
+    // 确保首字符是字母或下划线
+    if (word.length > 0 && this.isIdentifierStartChar(word[0])) {
+      return word;
+    }
+    return '';
   }
 
   private isLikelyOpeningQuote(line: string, charIndex: number, quote: string): boolean {
@@ -1395,5 +1747,126 @@ export class SmartReplaceHandler {
       escape = false;
     }
     return count % 2 === 0;
+  }
+
+  /**
+   * 计算字符串中换行符的数量
+   * 不使用正则表达式
+   */
+  private countNewlines(text: string): number {
+    let count = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === '\n') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 检查字符是否是允许出现在括号之间的字符
+   * 不使用正则表达式
+   */
+  private isAllowedBetweenChar(char: string): boolean {
+    const allowed = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_<>[]?!:.,|&';
+    return allowed.includes(char);
+  }
+
+  /**
+   * 检查字符是否是标识符字符（字母、数字、下划线）
+   */
+  private isIdentifierChar(char: string): boolean {
+    const code = char.charCodeAt(0);
+    // A-Z: 65-90, a-z: 97-122, 0-9: 48-57, _: 95
+    return (code >= 65 && code <= 90) ||
+           (code >= 97 && code <= 122) ||
+           (code >= 48 && code <= 57) ||
+           code === 95;
+  }
+
+  /**
+   * 检查字符是否是标识符起始字符（字母、下划线）
+   */
+  private isIdentifierStartChar(char: string): boolean {
+    const code = char.charCodeAt(0);
+    // A-Z: 65-90, a-z: 97-122, _: 95
+    return (code >= 65 && code <= 90) ||
+           (code >= 97 && code <= 122) ||
+           code === 95;
+  }
+
+  /**
+   * 检查字符串是否只包含空白字符（空格、制表符、换行符）
+   * 不使用正则表达式
+   */
+  private isWhitespaceOnly(text: string): boolean {
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * 检查字符串是否是配对符骨架（如 "()", "{}", "[]", "(", "{", "["）
+   * 不使用正则表达式
+   */
+  private isPairSkeletonString(str: string): boolean {
+    if (str.length === 0 || str.length > 2) {
+      return false;
+    }
+    const openChars = '([{';
+    const closeChars = ')]}';
+
+    if (str.length === 1) {
+      // 单个开括号
+      return openChars.includes(str[0]);
+    }
+
+    // 长度为 2：必须是开括号+对应闭括号
+    const openIdx = openChars.indexOf(str[0]);
+    if (openIdx === -1) {
+      return false;
+    }
+    // 闭括号可以是对应的，也可以省略
+    return str[1] === closeChars[openIdx] || closeChars.includes(str[1]);
+  }
+
+  /**
+   * 去除字符串末尾的注释（// 或 # 或 /*）
+   * 不使用正则表达式
+   */
+  private stripTrailingComment(line: string): string {
+    // 查找 // 注释
+    const slashSlashIdx = line.indexOf('//');
+    // 查找 # 注释
+    const hashIdx = line.indexOf('#');
+    // 查找 /* 注释
+    const slashStarIdx = line.indexOf('/*');
+
+    let cutIdx = line.length;
+
+    if (slashSlashIdx !== -1 && slashSlashIdx < cutIdx) {
+      cutIdx = slashSlashIdx;
+    }
+    if (hashIdx !== -1 && hashIdx < cutIdx) {
+      cutIdx = hashIdx;
+    }
+    if (slashStarIdx !== -1 && slashStarIdx < cutIdx) {
+      cutIdx = slashStarIdx;
+    }
+
+    if (cutIdx === line.length) {
+      return line;
+    }
+
+    // 去除注释前的尾部空白
+    let result = line.substring(0, cutIdx);
+    while (result.length > 0 && (result[result.length - 1] === ' ' || result[result.length - 1] === '\t')) {
+      result = result.substring(0, result.length - 1);
+    }
+    return result;
   }
 }
