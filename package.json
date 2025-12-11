@@ -20,6 +20,7 @@
   "activationEvents": [
     "onCommand:demotyper.toggleSecretMode",
     "onCommand:demotyper.setAsTargetFile",
+    "onCommand:demotyper.setTargetFile",
     "onCommand:demotyper.clearTargetFile",
     "onCommand:demotyper.restoreCurrentFile",
     "onCommand:demotyper.jumpToNextGap",
@@ -52,6 +53,10 @@
       {
         "command": "demotyper.setAsTargetFile",
         "title": "DemoTyper: Set as Demo Target File"
+      },
+      {
+        "command": "demotyper.setTargetFile",
+        "title": "DemoTyper: Set as Demo Target File (alias)"
       },
       {
         "command": "demotyper.clearTargetFile",

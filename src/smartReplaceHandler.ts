@@ -627,6 +627,32 @@ export class SmartReplaceHandler {
       this.logger.info(`[DEBUG]   Current[${currentLineIndex}]: "${currentLine}"`);
       this.logger.info(`[DEBUG]   Target[${targetLineIndex}]: "${targetLine}"`);
 
+      // 如果目标行非空且当前行要插入的首个字符应该是换行（缺失整行/块），优先先插入换行+缩进，再逐字符补齐
+      if (targetLineIndex > currentLineIndex && this.isLineMissingAhead(currentLines, targetLines, currentLineIndex, targetLineIndex)) {
+        const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+        const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
+        const leadingSpaces = this.getLeadingSpaces(targetLine);
+        this.logger.info(`[DEBUG] Detected missing line/block before current content; insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+        return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+      }
+
+      // 特殊处理：当前行是目标行的前缀但包含额外语句（如多语句合并在一行）
+      if (currentLine.startsWith(targetLine) && currentLine.length > targetLine.length) {
+        const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+        const lineEndOffset = lineStartOffset + targetLine.length;
+        const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
+        const nextTargetLine = targetLines[targetLineIndex + 1] ?? '';
+        const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+
+        this.logger.info('[DEBUG] Current line is a prefix of target line but has extra content; inserting newline to split it');
+        // 仍然只插入换行+缩进（符号以外不批量写入）
+        return {
+          state: 'gap',
+          insertOffset: originalOffset,
+          nextChar: '\n' + leadingSpaces,
+        };
+      }
+
       if (this.isPlaceholderDeletionLine(currentLine)) {
         const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
         const originalOffset = this.mapNormalizedToOriginal(lineStartOffset, currentMapping);
@@ -711,12 +737,20 @@ export class SmartReplaceHandler {
         // 首先检查行开头是否匹配(去除缩进后)
         const currentTrimmed = currentLine.trim();
         const targetTrimmed = targetLine.trim();
+        const currentTrimmedLen = currentTrimmed.length;
+        const targetTrimmedLen = targetTrimmed.length;
+        // 对于 "()"/"{}" 之类的临时占位行，先继续补充内容，避免频繁插入换行导致死循环
+        const looksLikePairSkeleton = currentTrimmedLen > 0 &&
+          currentTrimmedLen <= 4 &&
+          /^[\(\[\{][\)\]\}]?$/.test(currentTrimmed);
+        const stillFilling = targetTrimmedLen > 0 &&
+          (currentTrimmedLen < targetTrimmedLen * 0.6 || looksLikePairSkeleton);
 
         // ⚠️ 重要: 只有当前行有实际内容时才做前缀检查
         // 如果当前行只有缩进(没有实际内容),说明是刚插入的空行,应该继续填充,不要再次插入换行
-        if (currentTrimmed.length > 0) {
+        if (!stillFilling && currentTrimmedLen > 0) {
           // 检查开头字符是否匹配(至少前3个字符或整个较短字符串)
-          const checkLen = Math.min(3, currentTrimmed.length, targetTrimmed.length);
+          const checkLen = Math.min(3, currentTrimmedLen, targetTrimmedLen);
           const currentPrefix = currentTrimmed.substring(0, checkLen);
           const targetPrefix = targetTrimmed.substring(0, checkLen);
 
@@ -724,28 +758,24 @@ export class SmartReplaceHandler {
             // 行开头就不匹配,说明是完全不同的行,需要在当前行前插入新行
             const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
             const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
+            const leadingSpaces = this.getLeadingSpaces(targetLine);
 
             this.logger.info(`[DEBUG] Line prefix mismatch (current: "${currentPrefix}", target: "${targetPrefix}")`);
             this.logger.info(`[DEBUG] Current line: "${currentLine}"`);
             this.logger.info(`[DEBUG] Target line: "${targetLine}"`);
-            this.logger.info(`[DEBUG] Insert newline before current line at offset ${originalOffset}`);
+            this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars before current line at offset ${originalOffset}`);
 
-            // ⚠️ 重要: 只插入 '\n',不带缩进!
-            // 因为我们插入的位置是当前行的行首,当前行已经有自己的缩进
-            // 如果插入 '\n' + leadingSpaces,会导致当前行的缩进累加(双重缩进BUG)
-            // 新行的缩进会在后续的逐字符插入中自然填充
-            return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' };
+            // 插入换行+目标行的缩进，让缺失行从新行开始逐字符补齐
+            return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
           }
+        } else if (stillFilling) {
+          this.logger.info('[DEBUG] Current line is short/structural; skip prefix-based newline insertion to continue filling characters');
         }
 
-        // 只有当前行长度达到目标行长度的50%以上时，才做相似度检测
-        // 否则可能是正在填充中的行，应该继续填充
-        const currentTrimmedLen = currentLine.trim().length;
-        const targetTrimmedLen = targetLine.trim().length;
-
-        if (currentTrimmedLen < targetTrimmedLen * 0.5) {
-          // 当前行太短，但开头匹配，可能还在填充中，继续往下执行逐字符比对
-          this.logger.info(`[DEBUG] Current line is still short (${currentTrimmedLen} < ${targetTrimmedLen * 0.5}), but prefix matches, continue filling`);
+        if (stillFilling) {
+          // 当前行太短或仅有配对符，继续逐字符填充
+          const threshold = (targetTrimmedLen * 0.6).toFixed(1);
+          this.logger.info(`[DEBUG] Current line is still short (${currentTrimmedLen} < ${threshold}), continue filling`);
         } else {
           // 当前行已经有足够长度，进行相似度检测
           // 使用LCS算法计算相似度（对小的插入/删除更鲁棒）
@@ -816,13 +846,23 @@ export class SmartReplaceHandler {
           const originalOffset = this.mapNormalizedToOriginal(charOffset, currentMapping);
 
           if (targetChar === undefined && currentChar !== undefined) {
+            // 当前行比目标行长，优先尝试将多余内容拆到下一行
+            if (targetLineIndex + 1 < targetLines.length) {
+              const nextTargetLine = targetLines[targetLineIndex + 1];
+              const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+              this.logger.info(`[DEBUG] Current line has extra content at pos ${charIdx}; inserting newline to split statements`);
+              return {
+                state: 'gap',
+                insertOffset: originalOffset,
+                nextChar: '\n' + leadingSpaces,
+              };
+            }
             if (this.isAutoPairClosingChar(currentChar)) {
               this.logger.info(
                 `[DEBUG] Skipping auto-paired closing char '${currentChar}' at line ${targetLineIndex}, pos ${charIdx} to allow target to catch up`,
               );
               continue;
             }
-            // 当前行比目标行长，这是不同步的情况
             this.logger.info(`[DEBUG] Current line is longer than target line at pos ${charIdx} (mismatch)`);
             this.logger.info(`[DEBUG] Current has extra content: "${currentLine.substring(charIdx)}"`);
             return { state: 'mismatch', offset: originalOffset };
@@ -1245,70 +1285,59 @@ export class SmartReplaceHandler {
     return lcs / longerLen;
   }
 
+  /**
+   * 检测是否存在“目标行在当前行之前缺失”的情况，
+   * 用于优先插入换行+缩进，再逐字符补齐内容（避免直接批量插入行内容）。
+   */
+  private isLineMissingAhead(
+    currentLines: string[],
+    targetLines: string[],
+    currentLineIndex: number,
+    targetLineIndex: number,
+  ): boolean {
+    if (targetLineIndex <= currentLineIndex) {
+      return false;
+    }
+    const targetLine = targetLines[targetLineIndex];
+    if (targetLine.trim().length === 0) {
+      return false; // 目标行为空行则不认为缺行
+    }
+
+    const currentLine = currentLines[currentLineIndex] || '';
+
+    // 如果当前行是紧随目标行之后的内容（例如缺了一整行/块），通常当前行的前缀会与目标后续行对不上
+    // 我们检查当前行是否与目标后续某行相似，如果是，则说明中间缺行
+    const maxLookAhead = 5;
+    for (let i = targetLineIndex + 1; i < Math.min(targetLineIndex + 1 + maxLookAhead, targetLines.length); i++) {
+      const candidate = targetLines[i];
+      if (candidate.trim().length === 0) {
+        continue;
+      }
+      const similarity = this.calculateLineSimilarity(currentLine, candidate);
+      if (similarity >= 0.5) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   private getAutoPairInsertion(input: string): { text: string; cursorBackOffset: number } | undefined {
     if (input.length !== 1) {
       return undefined;
     }
+
     const char = input[0];
     switch (char) {
       case '{':
         return { text: '{}', cursorBackOffset: 1 };
-      case '(': 
+      case '(':
         return { text: '()', cursorBackOffset: 1 };
       case '[':
         return { text: '[]', cursorBackOffset: 1 };
-      case '\'':
-        return { text: '\'\'', cursorBackOffset: 1 };
-      case '"':
-        return { text: '""', cursorBackOffset: 1 };
-      case '`':
-        return { text: '``', cursorBackOffset: 1 };
       default:
         return undefined;
     }
-  }
-
-
-  private findMatchingBracket(text: string, startIndex: number, openChar: string, closeChar: string): number | undefined {
-    if (startIndex >= text.length || text[startIndex] !== openChar) {
-      return undefined;
-    }
-
-    if (openChar === closeChar) {
-      for (let i = startIndex + 1; i < text.length; i++) {
-        const char = text[i];
-        if (char === '\\') {
-          i++;
-          continue;
-        }
-        if (char === closeChar) {
-          return i;
-        }
-        if (char === '\n') {
-          break;
-        }
-      }
-      return undefined;
-    }
-
-    let depth = 0;
-    for (let i = startIndex; i < text.length; i++) {
-      const char = text[i];
-      if (char === openChar) {
-        depth++;
-      } else if (char === closeChar) {
-        depth--;
-        if (depth === 0) {
-          return i;
-        }
-      } else if (char === '"' || char === '\'') {
-        const quoteEnd = this.findMatchingBracket(text, i, char, char);
-        if (quoteEnd !== undefined) {
-          i = quoteEnd;
-        }
-      }
-    }
-    return undefined;
   }
 
   private findBraceAfterParenthesis(

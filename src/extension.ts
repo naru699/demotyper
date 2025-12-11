@@ -37,6 +37,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('demotyper.setAsTargetFile', (uri?: vscode.Uri) =>
       setTargetFile(uri),
     ),
+    // Alias for compatibility with existing tests
+    vscode.commands.registerCommand('demotyper.setTargetFile', (uri?: vscode.Uri) =>
+      setTargetFile(uri),
+    ),
     vscode.commands.registerCommand('demotyper.clearTargetFile', async () => {
       await targetFileManager.clearTargetFile();
       statusBarManager.update(secretModeHandler.state);
