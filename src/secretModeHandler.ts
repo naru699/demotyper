@@ -15,6 +15,8 @@ export class SecretModeHandler implements vscode.Disposable {
   private interceptDisposables: vscode.Disposable[] = [];
   private interceptsActive = false;
   private typingLocked = false;
+  private completionCooldownUntil = 0;
+  private completionCooldownTimer: NodeJS.Timeout | undefined;
   private readonly stateEmitter = new vscode.EventEmitter<SecretModeState>();
   readonly onDidChangeState = this.stateEmitter.event;
 
@@ -46,6 +48,9 @@ export class SecretModeHandler implements vscode.Disposable {
       return;
     }
 
+    // 如果刚完成演示仍在冷却期，先解除冷却再允许重新启用
+    this.clearCompletionCooldown();
+
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       await this.notifications.warning('DemoTyper: Open an editor before enabling secret mode.');
@@ -71,6 +76,9 @@ export class SecretModeHandler implements vscode.Disposable {
   }
 
   async handleType(args: { text: string }): Promise<void> {
+    if (this.isCompletionCooldownActive()) {
+      return;
+    }
     if (!this.active) {
       await this.passThroughType(args);
       return;
@@ -110,6 +118,9 @@ export class SecretModeHandler implements vscode.Disposable {
   }
 
   async handleBackspace(): Promise<void> {
+    if (this.isCompletionCooldownActive()) {
+      return;
+    }
     if (!this.active) {
       await vscode.commands.executeCommand('default:deleteLeft');
       return;
@@ -147,6 +158,7 @@ export class SecretModeHandler implements vscode.Disposable {
     if (!this.active) {
       return;
     }
+    this.clearCompletionCooldown();
     this.active = false;
     this.disposeInterceptors();
     this.resetUndoBatch();
@@ -277,7 +289,7 @@ export class SecretModeHandler implements vscode.Disposable {
 
     if (result === 'inSync') {
       await this.notifications.info('DemoTyper: 当前文件已与目标文件一致，秘密模式自动关闭。');
-      await this.disable();
+      await this.completeWithCooldown(5000);
       return;
     }
 
@@ -371,6 +383,51 @@ export class SecretModeHandler implements vscode.Disposable {
     }
 
     return false;
+  }
+
+  private isCompletionCooldownActive(): boolean {
+    return this.completionCooldownUntil > Date.now();
+  }
+
+  private startCompletionCooldown(durationMs: number): void {
+    this.clearCompletionCooldown();
+    this.completionCooldownUntil = Date.now() + durationMs;
+    this.completionCooldownTimer = setTimeout(() => {
+      this.completionCooldownUntil = 0;
+      this.completionCooldownTimer = undefined;
+      if (!this.active) {
+        this.disposeInterceptors();
+      }
+    }, durationMs);
+  }
+
+  private clearCompletionCooldown(): void {
+    if (this.completionCooldownTimer) {
+      clearTimeout(this.completionCooldownTimer);
+      this.completionCooldownTimer = undefined;
+    }
+    this.completionCooldownUntil = 0;
+  }
+
+  private async completeWithCooldown(durationMs: number): Promise<void> {
+    if (!this.active) {
+      this.startCompletionCooldown(durationMs);
+      return;
+    }
+
+    this.active = false;
+    // 不立即 dispose interceptors，先进入冷却期吞掉多余输入
+    this.resetUndoBatch();
+    this.multiCursorWarningShown = false;
+    this.typingQueue = Promise.resolve();
+    this.smartReplaceHandler.reset();
+    this.statusBarManager.update(this.state);
+    this.notifyStateChange();
+
+    const seconds = Math.ceil(durationMs / 1000);
+    vscode.window.setStatusBarMessage(`DemoTyper: Demo completed, input locked for ${seconds}s.`, durationMs);
+
+    this.startCompletionCooldown(durationMs);
   }
 
 }
