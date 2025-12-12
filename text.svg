@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect x="0" y="0" width="128" height="128" rx="20" fill="#007ACC"/>
+  
+  <g font-family="Consolas, 'Courier New', monospace" font-weight="bold" font-size="80" text-anchor="middle" dominant-baseline="central">
+    <text x="42" y="64" fill="#FFFFFF">&gt;</text>
+    
+    <text x="90" y="64" fill="#FFFFFF">_
+      <animate attributeName="opacity" values="1;0.3;1" dur="1.2s" repeatCount="indefinite"/>
+    </text>
+  </g>
+</svg>

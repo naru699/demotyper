@@ -3,7 +3,8 @@
   "displayName": "DemoTyper",
   "description": "A VS Code / Cursor extension that simulates live coding demos via a secret typing mode.",
   "version": "1.1.0",
-  "publisher": "demotyper",
+  "publisher": "fcmNaNo2",
+  "icon": "resources/icon.png",
   "engines": {
     "vscode": "^1.75.0"
   },
