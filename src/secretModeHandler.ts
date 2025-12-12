@@ -278,7 +278,6 @@ export class SecretModeHandler implements vscode.Disposable {
     if (result === 'inSync') {
       await this.notifications.info('DemoTyper: 当前文件已与目标文件一致，秘密模式自动关闭。');
       await this.disable();
-      await this.passThroughType(args);
       return;
     }
 
