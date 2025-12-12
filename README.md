@@ -1,7 +1,7 @@
 # DemoTyper
 
 <p align="center">
-  <img src="resources/demotyper.svg" alt="DemoTyper Logo" width="128" height="128">
+  <img src="resources/demotyper.png" alt="DemoTyper Logo" width="128" height="128">
 </p>
 
 <p align="center">
