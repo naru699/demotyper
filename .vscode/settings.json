@@ -1,0 +1,29 @@
+{
+    "demotyper.fileSnippets": {
+        "log.js": [
+            {
+                "name": "片段 1: on()",
+                "content": "on(type: string, callback: MessageCallback): void {\n    if (!this.messageCallbacks.has(type)) {\n      this.messageCallbacks.set(type, []);\n    }\n    this.messageCallbacks.get(type)?.push(callback);\n    console.log(`[WebSocketService] 订阅消息类型: ${type}, 当前订阅数: ${this.messageCallbacks.get(type)?.length}`);\n  }",
+                "targetLine": 1,
+                "insertAfterLine": 0,
+                "blocks": [
+                    {
+                        "type": "unknown",
+                        "depth": 0,
+                        "startIndex": 50,
+                        "endIndex": 306
+                    },
+                    {
+                        "type": "control",
+                        "depth": 1,
+                        "startIndex": 94,
+                        "endIndex": 143,
+                        "parentType": "unknown"
+                    }
+                ],
+                "outerBlockType": "unknown",
+                "outerBlockDepth": 0
+            }
+        ]
+    }
+}

@@ -129,6 +129,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://example.com/demotyper.git"
-  }
+    "url": "https://github.com/fcmNaNo2/demotyper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fcmNaNo2/demotyper/issues"
+  },
+  "homepage": "https://github.com/fcmNaNo2/demotyper#readme"
 }
