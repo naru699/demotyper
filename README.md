@@ -1,22 +1,20 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/fcmNaNo2/demotyper/fix-brace-pairing/resources/demotyper.png" alt="DemoTyper Logo" width="150">
+
 # DemoTyper
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/fcmNaNo2/demotyper/fix-brace-pairing/resources/demotyper.png" alt="DemoTyper Logo" width="128" height="128">
-</p>
+**🎬 Simulate live coding demos with secret typing mode**
 
-<p align="center">
-  <strong>🎬 Simulate live coding demos with secret typing mode</strong><br>
-  <sub>用秘密输入模式模拟实时编程演示</sub>
-</p>
+用秘密输入模式模拟实时编程演示
 
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#usage">Usage</a> •
-  <a href="#commands">Commands</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#contributing">Contributing</a>
-</p>
+[![VS Code](https://img.shields.io/badge/VS%20Code-Extension-blue?logo=visualstudiocode)](https://github.com/fcmNaNo2/demotyper)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub release](https://img.shields.io/github/v/release/fcmNaNo2/demotyper)](https://github.com/fcmNaNo2/demotyper/releases)
+
+[Features](#features) • [Installation](#installation) • [Usage](#usage) • [Commands](#commands) • [Configuration](#configuration) • [Contributing](#contributing)
+
+</div>
 
 ---
 
