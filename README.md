@@ -1,11 +1,12 @@
 # DemoTyper
 
 <p align="center">
-  <img src="resources/demotyper.png" alt="DemoTyper Logo" width="128" height="128">
+  <img src="https://raw.githubusercontent.com/fcmNaNo2/demotyper/fix-brace-pairing/resources/demotyper.png" alt="DemoTyper Logo" width="128" height="128">
 </p>
 
 <p align="center">
-  <strong>Simulate live coding demos with secret typing mode</strong>
+  <strong>🎬 Simulate live coding demos with secret typing mode</strong><br>
+  <sub>用秘密输入模式模拟实时编程演示</sub>
 </p>
 
 <p align="center">
