@@ -778,19 +778,88 @@ export class SmartReplaceHandler {
         // 关键修复：不使用 cursorBackOffset，让光标停留在新行上
         // 这样下次循环会在新行处理，而不是重复检测同一位置导致死循环
         if (currentWithoutClosings.trim().length === 0 && targetTrimmed.length > 0) {
-          // 检查目标行是否也是纯闭合符号行（忽略缩进）
-          const targetContentTrimmed = targetTrimmed.trim();
-          const targetIsClosingOnly =
-            targetContentTrimmed.length > 0 &&
-            targetContentTrimmed.split('').every(c => this.isAutoPairClosingChar(c));
+          // ===== Closing-Prefix Match Guard (Strict) =====
+          // 场景：当前行仅“缩进 + 闭合符占位”，目标行以相同闭合符前缀开头且同一行继续
+          // 例如："} catch", "} else", "});"。此时不应拆行，否则会把闭合符推下去并导致重复/死循环。
+          let closingPrefixMatched = false;
+          const currentClosingSeq = currentTrimmedEnd.substring(currentWithoutClosings.length);
+          const targetTrimmedStart = targetLine.trimStart();
 
-          if (targetIsClosingOnly) {
-            // ===== Closing Indent Guard (Strict) =====
-            // 场景：当前行是“缩进 + 闭合符”，目标行也是闭合符行，但缩进不同。
-            // 不能拆行，否则会产生额外闭合符；应直接补/删缩进使闭合符对齐。
+          let targetClosingPrefix = '';
+          for (let i = 0; i < targetTrimmedStart.length; i++) {
+            const c = targetTrimmedStart[i];
+            // 仅结构性闭合符号参与前缀匹配：)]}
+            if (this.isAutoPairClosingChar(c) && this.getMatchingOpeningForClosing(c) !== undefined) {
+              targetClosingPrefix += c;
+            } else {
+              break;
+            }
+          }
+
+          const closingPrefixAligned =
+            targetClosingPrefix.length > 0 &&
+            (currentClosingSeq === targetClosingPrefix ||
+              (currentClosingSeq.length > 0 && targetClosingPrefix.startsWith(currentClosingSeq)));
+
+          if (closingPrefixAligned) {
+            closingPrefixMatched = true;
+
             const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
             const currentIndent = this.getLeadingSpaces(currentLine);
             const targetIndent = this.getLeadingSpaces(targetLine);
+
+            if (currentIndent.length > targetIndent.length) {
+              const deleteStart = lineStartOffset + targetIndent.length;
+              const deleteLength = currentIndent.length - targetIndent.length;
+              const deleteOriginalOffset = this.mapNormalizedToOriginal(deleteStart, currentMapping);
+              const deleteCountOriginal = this.calculateDeleteCountFromNormalized(deleteStart, deleteLength, currentMapping);
+
+              this.logger.info(
+                `[GAP-FIX] Closing-Prefix Match: prefix '${targetClosingPrefix}' matched; deleting ${deleteCountOriginal} excess indent chars`,
+              );
+              return {
+                state: 'gap',
+                insertOffset: deleteOriginalOffset,
+                nextChar: '',
+                deleteCount: deleteCountOriginal,
+              };
+            }
+
+            if (currentIndent.length < targetIndent.length) {
+              const missingIndent = targetIndent.substring(currentIndent.length);
+              const insertPos = lineStartOffset + currentIndent.length;
+              const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
+
+              this.logger.info(
+                `[GAP-FIX] Closing-Prefix Match: prefix '${targetClosingPrefix}' matched; inserting ${missingIndent.length} indent chars`,
+              );
+              return {
+                state: 'gap',
+                insertOffset: originalOffset,
+                nextChar: missingIndent,
+              };
+            }
+
+            this.logger.info(
+              `[GAP-FIX] Closing-Prefix Match: current '${currentClosingSeq}' aligns with target prefix '${targetClosingPrefix}', skip split`,
+            );
+          }
+          // ===== Closing-Prefix Match Guard End =====
+
+          if (!closingPrefixMatched) {
+            // 检查目标行是否也是纯闭合符号行（忽略缩进）
+            const targetContentTrimmed = targetTrimmed.trim();
+            const targetIsClosingOnly =
+              targetContentTrimmed.length > 0 &&
+              targetContentTrimmed.split('').every(c => this.isAutoPairClosingChar(c));
+
+            if (targetIsClosingOnly) {
+              // ===== Closing Indent Guard (Strict) =====
+              // 场景：当前行是“缩进 + 闭合符”，目标行也是闭合符行，但缩进不同。
+              // 不能拆行，否则会产生额外闭合符；应直接补/删缩进使闭合符对齐。
+              const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+              const currentIndent = this.getLeadingSpaces(currentLine);
+              const targetIndent = this.getLeadingSpaces(targetLine);
 
             if (currentIndent.length > targetIndent.length) {
               // 删除多余缩进
@@ -823,28 +892,29 @@ export class SmartReplaceHandler {
             }
             // 缩进已一致，继续后续逐字符逻辑
             // ===== Closing Indent Guard End =====
-          } else {
-            // 目标有实际内容，必须拆行
-            const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
-            const currentIndent = this.getLeadingSpaces(currentLine);
-            const insertPos = lineStartOffset + currentIndent.length;
-            const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
+            } else {
+              // 目标有实际内容，必须拆行
+              const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+              const currentIndent = this.getLeadingSpaces(currentLine);
+              const insertPos = lineStartOffset + currentIndent.length;
+              const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
 
-            // 构建插入文本：换行 + 缩进
-            const insertText = '\n' + currentIndent;
+              // 构建插入文本：换行 + 缩进
+              const insertText = '\n' + currentIndent;
 
-            this.logger.info(`[GAP-FIX] High-Priority: Trailing closing on whitespace-only line. Forward Split (no retreat).`);
-            this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
-            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursor will stay on new line`);
+              this.logger.info(`[GAP-FIX] High-Priority: Trailing closing on whitespace-only line. Forward Split (no retreat).`);
+              this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
+              this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursor will stay on new line`);
 
-            // 关键：不设置 cursorBackOffset，让光标停留在新行末尾
-            // 这样下次循环时，光标在新行，可以继续填充 target 内容
-            return {
-              state: 'gap',
-              insertOffset: originalOffset,
-              nextChar: insertText,
-              // 不设置 cursorBackOffset - 让光标前进到新行
-            };
+              // 关键：不设置 cursorBackOffset，让光标停留在新行末尾
+              // 这样下次循环时，光标在新行，可以继续填充 target 内容
+              return {
+                state: 'gap',
+                insertOffset: originalOffset,
+                nextChar: insertText,
+                // 不设置 cursorBackOffset - 让光标前进到新行
+              };
+            }
           }
         }
         // ===== High-Priority Guard End =====
