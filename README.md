@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/fcmNaNo2/demotyper/fix-brace-pairing/resources/demotyper.png" alt="DemoTyper Logo" width="150">
-
 # DemoTyper
 
 **🎬 Simulate live coding demos with secret typing mode**
