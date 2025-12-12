@@ -642,44 +642,54 @@ export class SmartReplaceHandler {
               } else {
                 // 下一行不匹配，向前查找：nextCurrentLine 是否匹配 target 的后续行
                 // 增加查找范围到30行，并使用灵活匹配（忽略尾部空白和注释）
-                let foundInLaterTarget = false;
-                let matchedTargetIndex = -1;
-                const maxLookAhead = 30;
 
-                for (let i = targetLineIndex + 2; i < Math.min(targetLineIndex + 2 + maxLookAhead, targetLines.length); i++) {
-                  const candidate = targetLines[i];
-                  if (candidate.trim().length === 0) {
-                    continue; // 空白行不参与向前匹配，避免无限插入空行
-                  }
-                  // 先尝试严格匹配，再尝试灵活匹配
-                  if (nextCurrentLine === candidate ||
-                      this.linesEssentiallyMatch(nextCurrentLine, candidate)) {
-                    foundInLaterTarget = true;
-                    matchedTargetIndex = i;
-                    this.logger.info(`[DEBUG] Current[${currentLineIndex + 1}] matches Target[${i}] (distance: ${i - (targetLineIndex + 1)}), indicating Target[${targetLineIndex + 1}] is missing`);
-                    break;
-                  }
-                }
-
-                if (foundInLaterTarget) {
-                  // Current的下一行匹配Target的更后面的行，说明中间缺行
-                  const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
-
-                  const missingLineCount = matchedTargetIndex - (targetLineIndex + 1);
-                  this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but next line mismatch indicates ${missingLineCount} missing line(s)`);
-                  this.logger.info(`[DEBUG] Current next line matches Target[${matchedTargetIndex}], so Target[${targetLineIndex + 1}] to Target[${matchedTargetIndex - 1}] are missing`);
-
-                  // 插入换行符 + 缺失行的缩进
-                  const nextTargetLine = targetLines[targetLineIndex + 1];
-                  const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
-                  this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
-                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+                // ===== 弱锚点守卫 =====
+                // 如果 nextCurrentLine 是弱锚点（只有结构符号如 }、};），拒绝用它做向前匹配
+                // 这防止了 "}" 匹配未来某个 "}" 导致的误判和死循环
+                if (this.isStructuralLine(nextCurrentLine)) {
+                  this.logger.info(`[WEAK-ANCHOR] Skip lookahead: nextCurrentLine "${nextCurrentLine.trim()}" is a weak anchor (structural symbols only)`);
                 } else {
-                  // 没有在附近找到匹配，可能是大范围的行变化
-                  // 不做处理，继续到下一轮逐字符比对
-                  this.logger.info(`[DEBUG] Next line mismatch, but no nearby match found (checked ${maxLookAhead} lines ahead)`);
-                  this.logger.info(`[DEBUG] Will continue with character-by-character comparison`);
-                }
+                  // ===== 弱锚点守卫结束 =====
+
+                  let foundInLaterTarget = false;
+                  let matchedTargetIndex = -1;
+                  const maxLookAhead = 30;
+
+                  for (let i = targetLineIndex + 2; i < Math.min(targetLineIndex + 2 + maxLookAhead, targetLines.length); i++) {
+                    const candidate = targetLines[i];
+                    if (candidate.trim().length === 0) {
+                      continue; // 空白行不参与向前匹配，避免无限插入空行
+                    }
+                    // 先尝试严格匹配，再尝试灵活匹配
+                    if (nextCurrentLine === candidate ||
+                        this.linesEssentiallyMatch(nextCurrentLine, candidate)) {
+                      foundInLaterTarget = true;
+                      matchedTargetIndex = i;
+                      this.logger.info(`[DEBUG] Current[${currentLineIndex + 1}] matches Target[${i}] (distance: ${i - (targetLineIndex + 1)}), indicating Target[${targetLineIndex + 1}] is missing`);
+                      break;
+                    }
+                  }
+
+                  if (foundInLaterTarget) {
+                    // Current的下一行匹配Target的更后面的行，说明中间缺行
+                    const originalOffset = this.mapNormalizedToOriginal(lineEndOffset, currentMapping);
+
+                    const missingLineCount = matchedTargetIndex - (targetLineIndex + 1);
+                    this.logger.info(`[DEBUG] Line ${targetLineIndex} matches, but next line mismatch indicates ${missingLineCount} missing line(s)`);
+                    this.logger.info(`[DEBUG] Current next line matches Target[${matchedTargetIndex}], so Target[${targetLineIndex + 1}] to Target[${matchedTargetIndex - 1}] are missing`);
+
+                    // 插入换行符 + 缺失行的缩进
+                    const nextTargetLine = targetLines[targetLineIndex + 1];
+                    const leadingSpaces = this.getLeadingSpaces(nextTargetLine);
+                    this.logger.info(`[DEBUG] Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+                    return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+                  } else {
+                    // 没有在附近找到匹配，可能是大范围的行变化
+                    // 不做处理，继续到下一轮逐字符比对
+                    this.logger.info(`[DEBUG] Next line mismatch, but no nearby match found (checked ${maxLookAhead} lines ahead)`);
+                    this.logger.info(`[DEBUG] Will continue with character-by-character comparison`);
+                  }
+                } // 弱锚点守卫 else 结束
               }
             }
           } else {
@@ -746,14 +756,74 @@ export class SmartReplaceHandler {
 
         this.logger.info(`[DEBUG] Found ${trailingClosingCount} trailing closing char(s), currentWithoutClosings="${currentWithoutClosings}"`);
 
-        // ===== High-Priority Guard: Split & Retreat for Empty Lines =====
+        // ===== Smart Guard: Rigid Pair Identity Check (Strict) =====
+        // 仅当末尾闭合符与同一行内最近的开符对应时，视为“刚性配对骨架”
+        // 这样可以在 () / {} / [] 内继续填充目标字符，避免误拆行导致死循环或多余闭符。
+        const lastClosingChar = currentTrimmedEnd[currentTrimmedEnd.length - 1];
+        const expectedOpeningChar = this.getMatchingOpeningForClosing(lastClosingChar);
+        const lastNonWhitespaceChar = this.getLastNonWhitespaceChar(currentWithoutClosings);
+        const isRigidPair =
+          expectedOpeningChar !== undefined &&
+          lastNonWhitespaceChar !== undefined &&
+          lastNonWhitespaceChar === expectedOpeningChar;
+        this.logger.info(
+          `[DEBUG] SmartGuard: lastClosing='${lastClosingChar}', lastNonWs='${lastNonWhitespaceChar ?? ''}', expectedOpen='${expectedOpeningChar ?? ''}', rigidPair=${isRigidPair}`,
+        );
+        // ===== Smart Guard End =====
+
+        // ===== High-Priority Guard: Forward Split (Fixed) =====
         // 如果当前行（去掉闭合符后）只有空白字符，且目标行有实际内容
         // 必须先拆行，将占位符推到下一行，而不是直接插入字符
+        //
+        // 关键修复：不使用 cursorBackOffset，让光标停留在新行上
+        // 这样下次循环会在新行处理，而不是重复检测同一位置导致死循环
         if (currentWithoutClosings.trim().length === 0 && targetTrimmed.length > 0) {
-          // 检查目标行是否也是纯闭合符号行
-          const targetIsClosingOnly = targetTrimmed.split('').every(c => this.isAutoPairClosingChar(c));
+          // 检查目标行是否也是纯闭合符号行（忽略缩进）
+          const targetContentTrimmed = targetTrimmed.trim();
+          const targetIsClosingOnly =
+            targetContentTrimmed.length > 0 &&
+            targetContentTrimmed.split('').every(c => this.isAutoPairClosingChar(c));
 
-          if (!targetIsClosingOnly) {
+          if (targetIsClosingOnly) {
+            // ===== Closing Indent Guard (Strict) =====
+            // 场景：当前行是“缩进 + 闭合符”，目标行也是闭合符行，但缩进不同。
+            // 不能拆行，否则会产生额外闭合符；应直接补/删缩进使闭合符对齐。
+            const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+            const currentIndent = this.getLeadingSpaces(currentLine);
+            const targetIndent = this.getLeadingSpaces(targetLine);
+
+            if (currentIndent.length > targetIndent.length) {
+              // 删除多余缩进
+              const deleteStart = lineStartOffset + targetIndent.length;
+              const deleteLength = currentIndent.length - targetIndent.length;
+              const deleteOriginalOffset = this.mapNormalizedToOriginal(deleteStart, currentMapping);
+              const deleteCountOriginal = this.calculateDeleteCountFromNormalized(deleteStart, deleteLength, currentMapping);
+
+              this.logger.info(`[GAP-FIX] Closing Indent Guard: deleting ${deleteCountOriginal} excess indent chars to match closing-only target line`);
+              return {
+                state: 'gap',
+                insertOffset: deleteOriginalOffset,
+                nextChar: '',
+                deleteCount: deleteCountOriginal,
+              };
+            }
+
+            if (currentIndent.length < targetIndent.length) {
+              // 补齐缺失缩进（在闭合符前插入）
+              const missingIndent = targetIndent.substring(currentIndent.length);
+              const insertPos = lineStartOffset + currentIndent.length;
+              const originalOffset = this.mapNormalizedToOriginal(insertPos, currentMapping);
+
+              this.logger.info(`[GAP-FIX] Closing Indent Guard: inserting ${missingIndent.length} indent chars before closing-only line`);
+              return {
+                state: 'gap',
+                insertOffset: originalOffset,
+                nextChar: missingIndent,
+              };
+            }
+            // 缩进已一致，继续后续逐字符逻辑
+            // ===== Closing Indent Guard End =====
+          } else {
             // 目标有实际内容，必须拆行
             const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
             const currentIndent = this.getLeadingSpaces(currentLine);
@@ -763,22 +833,26 @@ export class SmartReplaceHandler {
             // 构建插入文本：换行 + 缩进
             const insertText = '\n' + currentIndent;
 
-            this.logger.info(`[GAP-FIX] High-Priority: Trailing closing on whitespace-only line. Splitting & Retreating.`);
+            this.logger.info(`[GAP-FIX] High-Priority: Trailing closing on whitespace-only line. Forward Split (no retreat).`);
             this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
-            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursorBackOffset=${insertText.length}`);
+            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursor will stay on new line`);
 
+            // 关键：不设置 cursorBackOffset，让光标停留在新行末尾
+            // 这样下次循环时，光标在新行，可以继续填充 target 内容
             return {
               state: 'gap',
               insertOffset: originalOffset,
               nextChar: insertText,
-              cursorBackOffset: insertText.length,
+              // 不设置 cursorBackOffset - 让光标前进到新行
             };
           }
         }
         // ===== High-Priority Guard End =====
 
         // 场景 A: 当前行（去掉闭合符）是目标行的前缀，说明闭合符是占位符
-        if (currentWithoutClosings.length > 0 &&
+        // 仅在刚性配对成立时豁免拆行，允许在配对内部继续填充
+        if (isRigidPair &&
+            currentWithoutClosings.length > 0 &&
             targetTrimmed.startsWith(currentWithoutClosings) &&
             currentWithoutClosings.length < targetTrimmed.length) {
           const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
@@ -810,10 +884,10 @@ export class SmartReplaceHandler {
             this.logger.info(`[DEBUG] Both current and target are closing-only lines`);
             // 继续下面的逐字符比对
           } else {
-            // ===== Split & Retreat Fix =====
+            // ===== Forward Split Fix (Fixed) =====
             // 目标行有实际内容，而当前行只有占位符
-            // 正确做法：先插入换行符，将占位符推到下一行，然后光标回退
-            // 这样下一次击键时，代码会写在空行上，占位符在下面
+            // 正确做法：插入换行符，将占位符推到下一行
+            // 关键：不使用 cursorBackOffset，让光标停留在新行上
             const lineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
             // 插入位置在缩进之后，占位符之前
             const insertPos = lineStartOffset + currentIndent.length;
@@ -822,17 +896,18 @@ export class SmartReplaceHandler {
             // 构建插入文本：换行 + 当前行缩进（占位符保持原缩进）
             const insertText = '\n' + currentIndent;
 
-            this.logger.info(`[GAP-FIX] Trailing closing detected on placeholder-only line. Splitting & Retreating.`);
+            this.logger.info(`[GAP-FIX] Scenario B: Placeholder-only line. Forward Split (no retreat).`);
             this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
-            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}) at offset ${originalOffset}, cursorBackOffset=${insertText.length}`);
+            this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursor will stay on new line`);
 
+            // 关键：不设置 cursorBackOffset，让光标前进到新行
             return {
               state: 'gap',
               insertOffset: originalOffset,
               nextChar: insertText,
-              cursorBackOffset: insertText.length,
+              // 不设置 cursorBackOffset - 让光标前进到新行
             };
-            // ===== Split & Retreat Fix End =====
+            // ===== Forward Split Fix End =====
           }
         }
       }
@@ -985,34 +1060,42 @@ export class SmartReplaceHandler {
           // 如果相似度>=50%，再检查"向前查找"：当前行是否匹配目标的后续行
           // 增加查找范围到30行，并使用灵活匹配
           if (similarity >= 0.5 && targetLineIndex + 1 < targetLines.length) {
-            const maxLookAhead = 30;
-            // 检查当前行是否匹配目标的后续某一行（查找附近30行，支持灵活匹配）
-            for (
-              let futureTargetIdx = targetLineIndex + 1;
-              futureTargetIdx < Math.min(targetLineIndex + 1 + maxLookAhead, targetLines.length);
-              futureTargetIdx++
-            ) {
-              const futureCandidate = targetLines[futureTargetIdx];
-              if (futureCandidate.trim().length === 0) {
-                continue; // 空白行不参与向前匹配，避免在空白块上重复插入换行
+            // ===== 弱锚点守卫 =====
+            // 如果 currentLine 是弱锚点，拒绝用它做向前匹配
+            if (this.isStructuralLine(currentLine)) {
+              this.logger.info(`[WEAK-ANCHOR] Skip forward lookup: currentLine "${currentLine.trim()}" is a weak anchor (structural symbols only)`);
+            } else {
+              // ===== 弱锚点守卫结束 =====
+
+              const maxLookAhead = 30;
+              // 检查当前行是否匹配目标的后续某一行（查找附近30行，支持灵活匹配）
+              for (
+                let futureTargetIdx = targetLineIndex + 1;
+                futureTargetIdx < Math.min(targetLineIndex + 1 + maxLookAhead, targetLines.length);
+                futureTargetIdx++
+              ) {
+                const futureCandidate = targetLines[futureTargetIdx];
+                if (futureCandidate.trim().length === 0) {
+                  continue; // 空白行不参与向前匹配，避免在空白块上重复插入换行
+                }
+                if (currentLine === futureCandidate ||
+                    this.linesEssentiallyMatch(currentLine, futureCandidate)) {
+                  // 当前行匹配目标的后续行，说明目标的当前行在current中缺失
+                  const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
+                  const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
+
+                  const missingLineCount = futureTargetIdx - targetLineIndex;
+
+                  this.logger.info(`[DEBUG] Forward lookup: Current[${currentLineIndex}] matches Target[${futureTargetIdx}] (distance: ${missingLineCount})`);
+                  this.logger.info(`[DEBUG] This means Target[${targetLineIndex}] to Target[${futureTargetIdx - 1}] are missing (${missingLineCount} lines)`);
+
+                  // 插入换行符 + 目标行的缩进
+                  const leadingSpaces = this.getLeadingSpaces(targetLine);
+                  this.logger.info(`[DEBUG] Forward lookup: Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
+                  return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
+                }
               }
-              if (currentLine === futureCandidate ||
-                  this.linesEssentiallyMatch(currentLine, futureCandidate)) {
-                // 当前行匹配目标的后续行，说明目标的当前行在current中缺失
-                const currentLineStartOffset = this.getLineStartOffset(normalizedCurrent, currentLineIndex);
-                const originalOffset = this.mapNormalizedToOriginal(currentLineStartOffset, currentMapping);
-
-                const missingLineCount = futureTargetIdx - targetLineIndex;
-
-                this.logger.info(`[DEBUG] Forward lookup: Current[${currentLineIndex}] matches Target[${futureTargetIdx}] (distance: ${missingLineCount})`);
-                this.logger.info(`[DEBUG] This means Target[${targetLineIndex}] to Target[${futureTargetIdx - 1}] are missing (${missingLineCount} lines)`);
-
-                // 插入换行符 + 目标行的缩进
-                const leadingSpaces = this.getLeadingSpaces(targetLine);
-                this.logger.info(`[DEBUG] Forward lookup: Insert newline + ${leadingSpaces.length} indent chars at offset ${originalOffset}`);
-                return { state: 'gap', insertOffset: originalOffset, nextChar: '\n' + leadingSpaces };
-              }
-            }
+            } // 弱锚点守卫 else 结束
           }
         }
       }
@@ -1088,10 +1171,11 @@ export class SmartReplaceHandler {
 
           // CASE 2b: 目标还有字符，当前没有或不匹配
 
-          // ===== Split Line Guard (防止 Sticky Bracket) =====
+          // ===== Split Line Guard (防止 Sticky Bracket) - Fixed =====
           // 场景：当前行只有缩进+占位符（如 "    }"），目标行有实际内容（如 "    if (..."）
           // 如果直接插入 targetChar，会导致 "    i}" -> "    if}" 的粘连问题
-          // 正确做法：先插入换行符，把占位符推到下一行，然后再插入内容
+          // 正确做法：先插入换行符，把占位符推到下一行
+          // 关键修复：不使用 cursorBackOffset，避免死循环
           if (currentChar !== undefined &&
               this.isAutoPairClosingChar(currentChar) &&
               targetChar !== undefined &&
@@ -1105,22 +1189,90 @@ export class SmartReplaceHandler {
               const currentIndent = this.getLeadingSpaces(currentLine);
               const insertText = '\n' + currentIndent;
 
-              this.logger.info(`[GAP-FIX] Splitting placeholder-only line to prevent sticky brackets`);
+              this.logger.info(`[GAP-FIX] CASE 2b: Splitting placeholder-only line. Forward Split (no retreat).`);
               this.logger.info(`[GAP-FIX] Before: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
-              this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}) at offset ${originalOffset}, cursorBackOffset=${insertText.length}`);
+              this.logger.info(`[GAP-FIX] Inserting newline + indent(${currentIndent.length}), cursor will stay on new line`);
 
-              // 关键：设置 cursorBackOffset = insertText.length
-              // 这样光标会回退到插入点之前，即停留在上一行末尾
-              // 而不是跟着跳到下一行紧贴 `}`
+              // 关键：不设置 cursorBackOffset，让光标停留在新行末尾
+              // 这样下次循环时，光标在新行，可以继续填充 target 内容
               return {
                 state: 'gap',
                 insertOffset: originalOffset,
                 nextChar: insertText,
-                cursorBackOffset: insertText.length,
+                // 不设置 cursorBackOffset - 让光标前进到新行
               };
             }
           }
           // ===== Split Line Guard End =====
+
+          // ===== Comment Split Guard (Smart Guard) =====
+          // 场景：当前行只有缩进+注释（如 "    // ..." 或 "    # ..."），但目标在这里需要代码。
+          // 如果直接插入 targetChar，会把代码粘到注释前形成垃圾行，并导致尾部重复。
+          if (currentChar !== undefined && targetChar !== undefined && targetChar !== '\n') {
+            const beforeCursor = currentLine.substring(0, charIdx);
+            const isBeforeCursorWhitespaceOnly = this.isWhitespaceOnly(beforeCursor);
+            const isCommentStart =
+              (currentChar === '/' &&
+                (currentLine[charIdx + 1] === '/' || currentLine[charIdx + 1] === '*')) ||
+              currentChar === '#';
+
+            if (isBeforeCursorWhitespaceOnly && isCommentStart) {
+              const currentIndent = this.getLeadingSpaces(currentLine);
+              const insertText = '\n' + currentIndent;
+
+              this.logger.info('[GAP-FIX] Comment Split: comment-only line blocks code; Forward Split (no retreat).');
+              this.logger.info(`[GAP-FIX] Current: "${currentLine}" | Target: "${targetLine.substring(0, 40)}..."`);
+
+              return {
+                state: 'gap',
+                insertOffset: originalOffset,
+                nextChar: insertText,
+              };
+            }
+          }
+          // ===== Comment Split Guard End =====
+
+          // ===== Indent Correction Guard =====
+          // 场景：Forward Split 后，当前行有多余空格，但 target 的闭合符缩进较少
+          // 例如：Current = "      " (6空格), Target = "    }" (4空格+})
+          // 在 char 4 位置：currentChar=' ', targetChar='}'
+          // 应该删除多余空格并跳到下一行让 placeholder 对齐，而不是插入新的 `}`
+          if (currentChar === ' ' &&
+              targetChar !== undefined &&
+              this.isAutoPairClosingChar(targetChar)) {
+            // 检查当前行剩余部分是否全是空格（即一个空的缩进行）
+            const remainingCurrent = currentLine.substring(charIdx);
+            if (this.isWhitespaceOnly(remainingCurrent)) {
+              // 当前行从 charIdx 到行末全是空格
+              // 检查后续行是否有 placeholder 闭合符
+              const nextLineIdx = currentLineIndex + 1;
+              if (nextLineIdx < currentLines.length) {
+                const nextCurrentLine = currentLines[nextLineIdx];
+                const nextCurrentTrimmed = nextCurrentLine.trim();
+                // 如果下一行只有闭合符，说明这是 Forward Split 后的情况
+                // 当前空行的多余空格需要删除，然后下一行的 `}` 会自然对齐
+                if (nextCurrentTrimmed.length > 0 &&
+                    nextCurrentTrimmed.split('').every(c => this.isAutoPairClosingChar(c))) {
+                  // 删除当前行剩余的空格
+                  const deleteStart = charOffset;
+                  const deleteLength = remainingCurrent.length;
+                  const deleteOriginalOffset = this.mapNormalizedToOriginal(deleteStart, currentMapping);
+                  const deleteCountOriginal = this.calculateDeleteCountFromNormalized(deleteStart, deleteLength, currentMapping);
+
+                  this.logger.info(`[GAP-FIX] Indent Correction: currentLine ends with ${remainingCurrent.length} excess spaces, target wants '${targetChar}'`);
+                  this.logger.info(`[GAP-FIX] Deleting ${deleteCountOriginal} chars at offset ${deleteOriginalOffset}, next line has placeholder '${nextCurrentTrimmed}'`);
+
+                  return {
+                    state: 'gap',
+                    insertOffset: deleteOriginalOffset,
+                    nextChar: '',
+                    deleteCount: deleteCountOriginal,
+                  };
+                }
+              }
+            }
+          }
+          // ===== Indent Correction Guard End =====
 
           // 标准处理：插入 targetChar，把占位符"推向右边"
           const nextChar = targetChar || '';
@@ -1211,21 +1363,29 @@ export class SmartReplaceHandler {
   }
 
   /**
-   * 检测某行是否是结构性的行（如闭合括号、只有空白等）
+   * 检测某行是否是弱锚点（只包含结构性符号，无辨识度）
+   * 用于防止向前查找时的误匹配导致死循环
+   *
+   * 弱锚点示例: "}", "};", "}}", "()", "[]"
+   * 强锚点示例: "i++", "return;", "x=0", "else"
    */
   private isStructuralLine(line: string): boolean {
     const trimmed = line.trim();
-    // 空行或只有结构符号（}, {, ); 等）
+    // 空行视为结构性行
     if (trimmed === '') {
       return true;
     }
-    // 检查是否只包含结构符号
+    // 检查是否只包含结构符号（括号、分号、逗号等）
     for (let i = 0; i < trimmed.length; i++) {
       const c = trimmed[i];
-      if (c !== '}' && c !== '{' && c !== ';' && c !== ',' && c !== ')' && c !== ']') {
+      // 允许的结构符号: {} () [] ; ,
+      if (c !== '}' && c !== '{' && c !== '(' && c !== ')' &&
+          c !== '[' && c !== ']' && c !== ';' && c !== ',') {
+        // 发现非结构符号（如字母、数字），这是强锚点
         return false;
       }
     }
+    // 全是结构符号，这是弱锚点
     return true;
   }
 
@@ -1306,6 +1466,36 @@ export class SmartReplaceHandler {
       return false;
     }
     return ')]}\'"`'.includes(char);
+  }
+
+  /**
+   * 获取闭合符号对应的开符号（仅结构性括号）
+   * 用于 Smart Guard 的“刚性配对”身份查验。
+   */
+  private getMatchingOpeningForClosing(closingChar: string): string | undefined {
+    switch (closingChar) {
+      case ')':
+        return '(';
+      case ']':
+        return '[';
+      case '}':
+        return '{';
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * 返回字符串中最后一个非空白字符（空格/制表符），若不存在返回 undefined。
+   */
+  private getLastNonWhitespaceChar(text: string): string | undefined {
+    for (let i = text.length - 1; i >= 0; i--) {
+      const c = text[i];
+      if (c !== ' ' && c !== '\t') {
+        return c;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -1396,7 +1586,16 @@ export class SmartReplaceHandler {
     const withoutComment1 = this.stripTrailingComment(trimmed1);
     const withoutComment2 = this.stripTrailingComment(trimmed2);
 
-    return withoutComment1 === withoutComment2;
+    if (withoutComment1 === withoutComment2) {
+      // 如果两行在去除注释后都为空，说明它们本质上是“纯注释/弱锚点行”
+      // 这种情况下不应做灵活匹配（否则会把不同注释误当成同一行，触发误拆行/误块删除）。
+      if (withoutComment1.trim().length === 0) {
+        return false;
+      }
+      return true;
+    }
+
+    return false;
   }
 
   private isPlaceholderDeletionLine(line: string): boolean {
@@ -1475,6 +1674,14 @@ export class SmartReplaceHandler {
     const maxLookAhead = 30; // 查找范围增加到30行，覆盖更多场景
 
     this.logger.info(`[DEBUG] detectBlockDeletion: checking if current[${currentLineIndex}]="${currentLine.trim()}" matches later target lines`);
+
+    // ===== 弱锚点守卫 =====
+    // 如果 currentLine 是弱锚点，拒绝用它做向前匹配
+    if (this.isStructuralLine(currentLine)) {
+      this.logger.info(`[WEAK-ANCHOR] Skip block deletion detection: currentLine "${currentLine.trim()}" is a weak anchor (structural symbols only)`);
+      return false;
+    }
+    // ===== 弱锚点守卫结束 =====
 
     for (let futureTargetIdx = targetLineIndex + 1;
          futureTargetIdx < Math.min(targetLineIndex + maxLookAhead + 1, targetLines.length);
